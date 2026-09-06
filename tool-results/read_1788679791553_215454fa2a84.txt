@@ -1,0 +1,1005 @@
+     1→/**
+     2→ * CryoFlow — RELION environment detection (SERVER ONLY, no "use client").
+     3→ *
+     4→ * Scans the host (and WSL distros when present) for EVERY RELION install,
+     5→ * probes each version, and composes the status around the SELECTED install:
+     6→ *   - full detection SNAPSHOT persists in data/relion-snapshot.json so a
+     7→ *     restart / cold WSL never blanks the environment: the saved status is
+     8→ *     served instantly (fromCache) and re-verified in the background
+     9→ *   - selection persists in data/relion-select.json ({ installId })
+    10→ *   - missing/stale selection → auto-pick by priority (RELION_HOME > PATH >
+    11→ *     known path > home scan > WSL bridge)
+    12→ *   - POST /api/system/select switches the active install at runtime
+    13→ *
+    14→ * Candidate sources per native install:
+    15→ *   a) process.env.RELION_HOME + /bin
+    16→ *   b) PATH lookup: `which relion_refine`
+    17→ *   c) known install paths (incl. the sandbox build target /home/z/relion-install/bin)
+    18→ *   d) home-directory scan (one level into well-known dev roots)
+    19→ * WSL installs: login-shell PATH, $RELION_HOME, filesystem search — ALL hits
+    20→ * (the whole WSL probe is ONE combined wsl.exe invocation — see probeWsl).
+    21→ * Fresh results are cached in-module for 10 min (background re-verification is
+    22→ * stale-while-revalidate; every extra wsl.exe call is another potential
+    23→ * console-window flash on Windows hosts); beyond the TTL (and on cold start)
+    24→ * the caller is served the last known status while a background probe
+    25→ * re-verifies. `force` (Re-detect button) bypasses everything.
+    26→ */
+    27→
+    28→import { execFile } from "child_process";
+    29→import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "fs";
+    30→import os from "os";
+    31→import path from "path";
+    32→import { DATA_DIR } from "@/lib/paths";
+    33→import type { SystemStatusClient, WslStatusClient } from "@/lib/types";
+    34→
+    35→/** Full server-side RELION status (same shape as the client mirror). */
+    36→export type RelionStatus = SystemStatusClient;
+    37→
+    38→/** Bundled dependency stack (sandbox / engine-relion-env parity). */
+    39→const DEPS_CTFFIND = "/home/z/relion-build/deps/ctffind/bin/ctffind";
+    40→
+    41→/** Resolve the ctffind executable a NATIVE install would use (PATH → bin dir → bundled deps). */
+    42→async function resolveNativeCtffind(binDir: string): Promise<string | null> {
+    43→  const onPath = await which("ctffind", 2000);
+    44→  if (onPath) return onPath;
+    45→  if (existsSync(path.join(binDir, "ctffind"))) return path.join(binDir, "ctffind");
+    46→  if (existsSync(DEPS_CTFFIND)) return DEPS_CTFFIND;
+    47→  return null;
+    48→}
+    49→
+    50→/** One discovered RELION install (native or inside a WSL distro). */
+    51→export interface RelionInstall {
+    52→  /** Stable selection key: "n:<binDir>" | "w:<distro>:<binDir>". */
+    53→  id: string;
+    54→  /** Parsed RELION version (null when unparseable). */
+    55→  version: string | null;
+    56→  /** bin dir (host path for native, distro-internal path for WSL). */
+    57→  path: string;
+    58→  /** Install root (parent of bin/). */
+    59→  relionHome: string;
+    60→  /** How this install was discovered. */
+    61→  source: string;
+    62→  /** "native": this process spawns the binaries directly. "wsl": bridge. */
+    63→  execution: "native" | "wsl";
+    64→  /** WSL distro name (WSL installs only). */
+    65→  distro: string | null;
+    66→  /** mpirun path (distro-internal for WSL installs; null → serial only). */
+    67→  mpirunPath: string | null;
+    68→  /** relion_refine_mpi present (MPI-capable install). */
+    69→  mpiBinary: boolean;
+    70→  /** ctffind path (null → CTF estimation jobs cannot run on this install). */
+    71→  ctffindPath: string | null;
+    72→  /** Restored from the saved last detection — the fresh probe could not
+    73→   *  re-verify it this round (e.g. WSL was cold). Re-detect re-verifies. */
+    74→  cached?: boolean;
+    75→}
+    76→
+    77→/* ------------------------------------------------------------------ */
+    78→/* Selection persistence (data/relion-select.json)                      */
+    79→/* ------------------------------------------------------------------ */
+    80→
+    81→const SELECT_FILE = path.join(DATA_DIR, "relion-select.json");
+    82→
+    83→function readSelectedId(): string | null {
+    84→  try {
+    85→    const parsed = JSON.parse(readFileSync(SELECT_FILE, "utf8")) as {
+    86→      installId?: unknown;
+    87→    };
+    88→    return typeof parsed.installId === "string" && parsed.installId.length > 0
+    89→      ? parsed.installId
+    90→      : null;
+    91→  } catch {
+    92→    return null;
+    93→  }
+    94→}
+    95→
+    96→function writeSelectedId(id: string | null): void {
+    97→  try {
+    98→    mkdirSync(DATA_DIR, { recursive: true });
+    99→    writeFileSync(SELECT_FILE, JSON.stringify({ installId: id }, null, 2));
+   100→  } catch {
+   101→    /* best effort — auto-pick still works without persistence */
+   102→  }
+   103→}
+   104→
+   105→/* ------------------------------------------------------------------ */
+   106→/* Detection snapshot persistence (data/relion-snapshot.json)           */
+   107→/* ------------------------------------------------------------------ */
+   108→
+   109→const SNAPSHOT_FILE = path.join(DATA_DIR, "relion-snapshot.json");
+   110→
+   111→/** Saved record of one full detection — installs, selection, verified
+   112→ *  binaries, WSL probe. Survives dev-server restarts and cold WSL VMs so
+   113→ *  the app NEVER re-detects from scratch just because it was reopened. */
+   114→interface Snapshot {
+   115→  savedAt: string;
+   116→  status: RelionStatus;
+   117→}
+   118→
+   119→/** Validate + revive one persisted install record (corrupt entries drop). */
+   120→function snapshotInstallFrom(raw: unknown): RelionInstall | null {
+   121→  if (typeof raw !== "object" || raw === null) return null;
+   122→  const r = raw as Record<string, unknown>;
+   123→  const id = typeof r.id === "string" ? r.id : "";
+   124→  const dir = typeof r.path === "string" ? r.path : "";
+   125→  const execution = r.execution === "native" || r.execution === "wsl" ? r.execution : null;
+   126→  if (!id || !dir || !execution) return null;
+   127→  return {
+   128→    id,
+   129→    version: typeof r.version === "string" ? r.version : null,
+   130→    path: dir,
+   131→    relionHome: typeof r.relionHome === "string" ? r.relionHome : dir.replace(/\/bin\/?$/, ""),
+   132→    source: typeof r.source === "string" && r.source ? r.source : "saved detection",
+   133→    execution,
+   134→    distro: typeof r.distro === "string" ? r.distro : null,
+   135→    mpirunPath: typeof r.mpirunPath === "string" ? r.mpirunPath : null,
+   136→    mpiBinary: r.mpiBinary === true,
+   137→    ctffindPath: typeof r.ctffindPath === "string" ? r.ctffindPath : null,
+   138→  };
+   139→}
+   140→
+   141→/** Read the saved detection, defensively (a corrupt file degrades to null). */
+   142→function readSnapshot(): Snapshot | null {
+   143→  try {
+   144→    const parsed = JSON.parse(readFileSync(SNAPSHOT_FILE, "utf8")) as {
+   145→      savedAt?: unknown;
+   146→      status?: unknown;
+   147→    };
+   148→    if (typeof parsed.status !== "object" || parsed.status === null) return null;
+   149→    const s = parsed.status as Record<string, unknown>;
+   150→    if (typeof s.found !== "boolean" || !Array.isArray(s.installs)) return null;
+   151→    const installs = (s.installs as unknown[])
+   152→      .map(snapshotInstallFrom)
+   153→      .filter((i): i is RelionInstall => i !== null)
+   154→      .slice(0, 16);
+   155→    if (installs.length === 0) return null;
+   156→    const w = typeof s.wsl === "object" && s.wsl !== null ? (s.wsl as Record<string, unknown>) : {};
+   157→    const wsl: WslStatusClient = {
+   158→      available: w.available === true,
+   159→      unavailableReason:
+   160→        w.unavailableReason === "no-wsl" || w.unavailableReason === "no-distro"
+   161→          ? w.unavailableReason
+   162→          : null,
+   163→      relionPath: typeof w.relionPath === "string" ? w.relionPath : null,
+   164→      relionHome: typeof w.relionHome === "string" ? w.relionHome : null,
+   165→      version: typeof w.version === "string" ? w.version : null,
+   166→      source: typeof w.source === "string" ? w.source : null,
+   167→      distro: typeof w.distro === "string" ? w.distro : null,
+   168→      note: typeof w.note === "string" ? w.note : "",
+   169→      mpirunPath: typeof w.mpirunPath === "string" ? w.mpirunPath : null,
+   170→      mpiBinary: w.mpiBinary === true,
+   171→      ctffindPath: typeof w.ctffindPath === "string" ? w.ctffindPath : null,
+   172→    };
+   173→    const list = (v: unknown): { name: string; present: boolean }[] =>
+   174→      Array.isArray(v)
+   175→        ? (v as unknown[]).flatMap((e) => {
+   176→            if (typeof e !== "object" || e === null) return [];
+   177→            const r = e as Record<string, unknown>;
+   178→            return typeof r.name === "string" ? [{ name: r.name, present: r.present === true }] : [];
+   179→          })
+   180→        : [];
+   181→    const status: RelionStatus = {
+   182→      found: s.found,
+   183→      execution: s.execution === "native" || s.execution === "wsl" ? s.execution : null,
+   184→      version: typeof s.version === "string" ? s.version : null,
+   185→      path: typeof s.path === "string" ? s.path : null,
+   186→      source: typeof s.source === "string" ? s.source : null,
+   187→      wsl,
+   188→      binaries: list(s.binaries),
+   189→      externals: list(s.externals),
+   190→      checkedAt: typeof s.checkedAt === "string" ? s.checkedAt : new Date(0).toISOString(),
+   191→      installs,
+   192→      selectedId: typeof s.selectedId === "string" ? s.selectedId : null,
+   193→      autoPicked: s.autoPicked === true,
+   194→    };
+   195→    return {
+   196→      savedAt: typeof parsed.savedAt === "string" ? parsed.savedAt : status.checkedAt,
+   197→      status,
+   198→    };
+   199→  } catch {
+   200→    return null;
+   201→  }
+   202→}
+   203→
+   204→/** Persist the latest detection (never the fromCache marker itself). */
+   205→function writeSnapshot(status: RelionStatus): void {
+   206→  try {
+   207→    mkdirSync(DATA_DIR, { recursive: true });
+   208→    const persist = { ...status };
+   209→    delete persist.fromCache;
+   210→    writeFileSync(
+   211→      SNAPSHOT_FILE,
+   212→      JSON.stringify({ savedAt: new Date().toISOString(), status: persist }, null, 2)
+   213→    );
+   214→  } catch {
+   215→    /* best effort — detection still works without persistence */
+   216→  }
+   217→}
+   218→
+   219→/** Auto-pick the default install by priority when nothing is selected. */
+   220→function pickDefaultInstall(installs: RelionInstall[]): RelionInstall | null {
+   221→  if (installs.length === 0) return null;
+   222→  const by = (fn: (i: RelionInstall) => boolean) => installs.find(fn) ?? null;
+   223→  return (
+   224→    by((i) => i.execution === "native" && i.source === "RELION_HOME") ??
+   225→    by((i) => i.execution === "native" && i.source === "PATH") ??
+   226→    by((i) => i.execution === "native" && i.source === "known-path") ??
+   227→    by((i) => i.execution === "native") ??
+   228→    installs[0]
+   229→  );
+   230→}
+   231→
+   232→/* ------------------------------------------------------------------ */
+   233→/* Small exec helpers                                                   */
+   234→/* ------------------------------------------------------------------ */
+   235→
+   236→function execFileAsync(
+   237→  file: string,
+   238→  args: string[],
+   239→  timeout: number
+   240→): Promise<{ stdout: string; stderr: string }> {
+   241→  return new Promise((resolve) => {
+   242→    execFile(
+   243→      file,
+   244→      args,
+   245→      { timeout, windowsHide: true },
+   246→      (error, stdout, stderr) => {
+   247→        // resolve in ALL cases — detection must never crash
+   248→        resolve({ stdout: String(stdout ?? ""), stderr: String(stderr ?? "") });
+   249→        void error;
+   250→      }
+   251→    );
+   252→  });
+   253→}
+   254→
+   255→/** `which <name>` → trimmed path or null. */
+   256→async function which(name: string, timeout = 2000): Promise<string | null> {
+   257→  const { stdout, stderr } = await execFileAsync("which", [name], timeout);
+   258→  const out = (stdout || stderr).trim().split("\n")[0] ?? "";
+   259→  return out.length > 0 && out.includes("/") ? out : null;
+   260→}
+   261→
+   262→/* ------------------------------------------------------------------ */
+   263→/* Binary lists                                                         */
+   264→/* ------------------------------------------------------------------ */
+   265→
+   266→/** Key RELION binaries we care about (existence is checked inside binDir). */
+   267→const CORE_BINARIES = [
+   268→  "relion_refine",
+   269→  "relion_preprocess",
+   270→  "relion_postprocess",
+   271→  "relion_mask_create",
+   272→  "relion_star_handler",
+   273→  "relion_ctf_refine",
+   274→  "relion_motion_refine",
+   275→  "relion_particle_subtract",
+   276→  "relion_run_ctffind",
+   277→  "relion_run_motioncorr",
+   278→  "relion_tomo_align",
+   279→  "relion_tomo_reconstruct_tomogram",
+   280→  "relion_tomo_subtomo",
+   281→  "relion_tomo_refine_ctf",
+   282→  "relion_tomo_reconstruct_particle",
+   283→  "relion_align_tiltseries",
+   284→];
+   285→
+   286→/** External programs RELION jobs may wrap. */
+   287→const EXTERNAL_PROGRAMS = ["motioncor2", "ctffind", "gctf", "topaz"];
+   288→
+   289→/** Scan the home directory (one level deep into well-known dev roots). */
+   290→function searchHomeCandidates(): { dir: string; source: string }[] {
+   291→  const home = os.homedir();
+   292→  const out: { dir: string; source: string }[] = [];
+   293→  const seen = new Set<string>();
+   294→  const push = (dir: string) => {
+   295→    if (!seen.has(dir)) {
+   296→      out.push({ dir, source: "home scan" });
+   297→      seen.add(dir);
+   298→    }
+   299→  };
+   300→  try {
+   301→    for (const entry of readdirSync(home)) {
+   302→      const top = path.join(home, entry);
+   303→      if (/relion/i.test(entry)) {
+   304→        push(path.join(top, "bin"));
+   305→      } else if (/^(myproject|my-project|src|build|builds|code|dev|projects|tools|opt)$/i.test(entry)) {
+   306→        try {
+   307→          for (const sub of readdirSync(top)) {
+   308→            if (/relion/i.test(sub)) push(path.join(top, sub, "bin"));
+   309→          }
+   310→        } catch {
+   311→          // unreadable subdir — skip
+   312→        }
+   313→      }
+   314→    }
+   315→  } catch {
+   316→    // unreadable home — skip
+   317→  }
+   318→  return out;
+   319→}
+   320→
+   321→interface NativeCandidate {
+   322→  dir: string;
+   323→  source: string;
+   324→}
+   325→
+   326→function candidateDirs(): NativeCandidate[] {
+   327→  const candidates: NativeCandidate[] = [];
+   328→  if (process.env.RELION_HOME) {
+   329→    candidates.push({ dir: path.join(process.env.RELION_HOME, "bin"), source: "RELION_HOME" });
+   330→    candidates.push({ dir: process.env.RELION_HOME, source: "RELION_HOME" });
+   331→  }
+   332→  const home = os.homedir();
+   333→  for (const dir of [
+   334→    "/home/z/relion-install/bin",
+   335→    "/usr/local/bin",
+   336→    "/opt/relion/bin",
+   337→    path.join(home, "relion-install/bin"),
+   338→    path.join(home, "relion/bin"),
+   339→  ]) {
+   340→    candidates.push({ dir, source: "known-path" });
+   341→  }
+   342→  candidates.push(...searchHomeCandidates());
+   343→  return candidates;
+   344→}
+   345→
+   346→/** A bin dir is valid when it exists and contains relion_refine (or _mpi). */
+   347→function isValidBinDir(dir: string): boolean {
+   348→  try {
+   349→    return (
+   350→      existsSync(path.join(dir, "relion_refine")) ||
+   351→      existsSync(path.join(dir, "relion_refine_mpi"))
+   352→    );
+   353→  } catch {
+   354→    return false;
+   355→  }
+   356→}
+   357→
+   358→/** Canonical path for dedupe (realpath when resolvable, else as-is). */
+   359→function canonical(dir: string): string {
+   360→  try {
+   361→    return realpathSync(dir);
+   362→  } catch {
+   363→    return dir;
+   364→  }
+   365→}
+   366→
+   367→/* ------------------------------------------------------------------ */
+   368→/* Version probing                                                      */
+   369→/* ------------------------------------------------------------------ */
+   370→
+   371→async function probeVersion(binDir: string): Promise<string | null> {
+   372→  // try both the non-MPI and MPI refine binaries (builds may ship either)
+   373→  for (const exe of ["relion_refine", "relion_refine_mpi"]) {
+   374→    const exePath = path.join(binDir, exe);
+   375→    if (!existsSync(exePath)) continue;
+   376→    const { stdout, stderr } = await execFileAsync(exePath, ["--version"], 8000);
+   377→    const text = `${stdout}\n${stderr}`;
+   378→    // "RELION version: 5.0.1-commit-d476e6" / "RELION v4.0" / "RELION 3.1.2"
+   379→    const match = text.match(/RELION\s*(?:version)?[:\s]*v?(\d+\.\d+(?:\.\d+)?)/i);
+   380→    if (match) return match[1];
+   381→    break; // ran but unparseable — fall through to inference
+   382→  }
+   383→  // Fall back: presence of the tomo toolchain implies RELION 5.x
+   384→  if (
+   385→    existsSync(path.join(binDir, "relion_tomo_align")) &&
+   386→    existsSync(path.join(binDir, "relion_tomo_reconstruct_tomogram"))
+   387→  ) {
+   388→    return "5.x (inferred)";
+   389→  }
+   390→  return null;
+   391→}
+   392→
+   393→/* ------------------------------------------------------------------ */
+   394→/* WSL detection (never crashes when wsl.exe is absent)                 */
+   395→/* ------------------------------------------------------------------ */
+   396→
+   397→/** Run a shell snippet inside the WSL default distro (login shell when login). */
+   398→async function wslBash(
+   399→  wslPath: string,
+   400→  snippet: string,
+   401→  login: boolean,
+   402→  timeout: number
+   403→): Promise<string> {
+   404→  const args = login
+   405→    ? ["-e", "bash", "-lc", snippet]
+   406→    : ["-e", "bash", "-c", snippet];
+   407→  const { stdout, stderr } = await execFileAsync(wslPath, args, timeout);
+   408→  return stdout.trim() || stderr.trim();
+   409→}
+   410→
+   411→/** Locate wsl.exe — on Windows hosts it is always resolvable through PATH. */
+   412→async function locateWslExe(): Promise<string | null> {
+   413→  if (process.platform === "win32") return "wsl.exe";
+   414→  return (await which("wsl.exe", 2000)) ?? (await which("wsl", 2000));
+   415→}
+   416→
+   417→/**
+   418→ * Verify RELION binaries + external programs INSIDE the WSL distro (one bash
+   419→ * call per list). The host filesystem cannot see WSL-side paths, so
+   420→ * existsSync-based checks would report everything as missing.
+   421→ */
+   422→async function probeWslBinaries(
+   423→  wslPath: string,
+   424→  binDir: string,
+   425→  bins: string[],
+   426→  exts: string[]
+   427→): Promise<{ bins: Set<string>; exts: Set<string> }> {
+   428→  const present = { bins: new Set<string>(), exts: new Set<string>() };
+   429→  const q = binDir.replace(/'/g, `'\\''`);
+   430→  const script = [
+   431→    // NOTE: $b/$e must stay OUTSIDE the single-quoted path — inside single
+   432→    // quotes bash never expands them and every check would fail silently.
+   433→    `for b in ${bins.join(" ")}; do test -x '${q}'/"$b" && echo "B:$b"; done`,
+   434→    `for e in ${exts.join(" ")}; do { command -v "$e" >/dev/null 2>&1 || test -x '${q}'/"$e"; } && echo "E:$e"; done`,
+   435→  ].join("; ");
+   436→  const { stdout } = await execFileAsync(
+   437→    wslPath,
+   438→    ["-e", "bash", "-lc", script],
+   439→    15000
+   440→  );
+   441→  for (const line of stdout.split("\n")) {
+   442→    const t = line.trim();
+   443→    if (t.startsWith("B:")) present.bins.add(t.slice(2));
+   444→    else if (t.startsWith("E:")) present.exts.add(t.slice(2));
+   445→  }
+   446→  return present;
+   447→}
+   448→
+   449→/** One WSL distro's full probe: distro name + every RELION install found. */
+   450→interface WslProbe {
+   451→  available: boolean;
+   452→  unavailableReason: "no-wsl" | "no-distro" | null;
+   453→  distro: string | null;
+   454→  installs: RelionInstall[];
+   455→  /** Guidance note when the distro is up but no RELION was found. */
+   456→  note: string;
+   457→}
+   458→
+   459→async function probeWsl(): Promise<WslProbe> {
+   460→  const empty = (reason: "no-wsl" | "no-distro", note: string): WslProbe => ({
+   461→    available: false,
+   462→    unavailableReason: reason,
+   463→    distro: null,
+   464→    installs: [],
+   465→    note,
+   466→  });
+   467→
+   468→  // 0. locate wsl.exe — on Windows hosts it is always resolvable through PATH
+   469→  const wslPath = await locateWslExe();
+   470→  if (!wslPath) {
+   471→    return empty(
+   472→      "no-wsl",
+   473→      "WSL is not installed on this host (no wsl.exe) — install RELION natively or point RELION_HOME at an existing install."
+   474→    );
+   475→  }
+   476→
+   477→  // ONE combined login-shell script (this used to be 6–10 separate wsl.exe
+   478→  // calls — sanity, login PATH, RELION_HOME, filesystem search, then version
+   479→  // + toolchain per install). Every extra wsl.exe invocation is another
+   480→  // potential console-window flash on Windows hosts and another cold-boot
+   481→  // round-trip. The 90 s budget absorbs a cold distro boot (10–30 s) inside
+   482→  // the SAME call; per-`--version` probes are bounded by `timeout 10` inside
+   483→  // the distro so a single hung binary cannot eat the whole script. Marker
+   484→  // lines are parsed by prefix — ~/.bashrc noise (login shell) is ignored.
+   485→  const script = [
+   486→    'echo "D:${WSL_DISTRO_NAME:-default}"',
+   487→    "P=$(command -v relion_refine 2>/dev/null || command -v relion_refine_mpi 2>/dev/null || true)",
+   488→    '[ -n "$P" ] && echo "P:${P%/*}" || true',
+   489→    "H=${RELION_HOME:-}",
+   490→    'H_OK=""',
+   491→    'if [ -n "$H" ]; then H=${H%/}; case "$H" in */bin) ;; *) H="$H/bin";; esac; if { test -x "$H/relion_refine" || test -x "$H/relion_refine_mpi"; }; then echo "H:$H"; H_OK=1; fi; fi',
+   492→    // per-install facts (version / mpirun / MPI binary / ctffind), keyed
+   493→    // "TAG:<dir>|<value>" so paths with spaces or colons survive
+   494→    "probe() {",
+   495→    '  d="$1"',
+   496→    '  V=$(timeout 10 "$d/relion_refine" --version 2>&1 || timeout 10 "$d/relion_refine_mpi" --version 2>&1 || true)',
+   497→    '  echo "V:$d|$V"',
+   498→    "  M=$(command -v mpirun 2>/dev/null || command -v mpiexec 2>/dev/null || true)",
+   499→    '  echo "M:$d|${M:-}"',
+   500→    '  if test -x "$d/relion_refine_mpi"; then echo "B:$d|yes"; else echo "B:$d|no"; fi',
+   501→    "C=$(command -v ctffind 2>/dev/null || { test -x \"$d/ctffind\" && printf '%s' \"$d/ctffind\"; } || true)",
+   502→    '  echo "C:$d|${C:-}"',
+   503→    "}",
+   504→    '[ -n "$P" ] && probe "${P%/*}" || true',
+   505→    '[ -n "$H_OK" ] && probe "$H" || true',
+   506→    // filesystem search across common install layouts — ALL hits (≤8)
+   507→    "n=0",
+   508→    'for d in "$HOME"/relion*/bin "$HOME"/myproject/relion*/bin "$HOME"/my-project/relion*/bin "$HOME"/src/relion*/bin "$HOME"/build/relion*/bin "$HOME"/builds/relion*/bin "$HOME"/code/relion*/bin "$HOME"/tools/relion*/bin /usr/local/relion*/bin /opt/relion*/bin /opt/relion*/*/bin /home/*/relion*/bin /home/*/myproject/relion*/bin /home/*/my-project/relion*/bin /home/*/src/relion*/bin /home/*/relion-build/*/bin; do',
+   509→    '  { test -x "$d/relion_refine" || test -x "$d/relion_refine_mpi"; } || continue',
+   510→    '  echo "S:$d"',
+   511→    '  probe "$d" || true',
+   512→    "  n=$((n + 1))",
+   513→    '  [ "$n" -ge 8 ] && break',
+   514→    "done",
+   515→    "true",
+   516→    'echo "END:ok"',
+   517→  ].join("\n");
+   518→  const out = await wslBash(wslPath, script, true, 90_000);
+   519→  const lines = out.split("\n").map((l) => l.trim()).filter(Boolean);
+   520→  const distroLine = lines.find((l) => l.startsWith("D:"));
+   521→  // no D: marker → wsl.exe answered with its own error (no distro registered,
+   522→  // or the distro stayed cold beyond the 90 s budget)
+   523→  if (!distroLine) {
+   524→    return empty(
+   525→      "no-distro",
+   526→      "WSL is installed but no distro responded (run `wsl --list --verbose`; if none is registered, `wsl --install -d Ubuntu` and re-detect)."
+   527→    );
+   528→  }
+   529→  const distro = distroLine.slice(2).trim() || null;
+   530→  // the probe script must never fail silently: D: without the trailing END:
+   531→  // marker means it broke midway (bash error, killed probe) — log it so
+   532→  // dev.log shows WHY the discovery found nothing
+   533→  if (!lines.some((l) => l.startsWith("END:"))) {
+   534→    console.error("relion/system: combined WSL probe ended early — output was:", out.slice(0, 400));
+   535→  }
+   536→
+   537→  // discovery markers → binDir set (source priority: login PATH >
+   538→  // RELION_HOME > filesystem search — emission order matches)
+   539→  const found = new Map<string, { source: string }>();
+   540→  const addHit = (dir: string, source: string) => {
+   541→    const d = dir.replace(/\/+$/, "");
+   542→    if (d.endsWith("/bin") && !found.has(d)) found.set(d, { source });
+   543→  };
+   544→  for (const l of lines) {
+   545→    if (l.length < 3 || l[1] !== ":") continue;
+   546→    if (l[0] !== "P" && l[0] !== "H" && l[0] !== "S") continue;
+   547→    const dir = l.slice(2);
+   548→    if (!dir.startsWith("/") || found.size >= 12) continue;
+   549→    addHit(
+   550→      dir,
+   551→      l[0] === "P" ? "login-shell PATH" : l[0] === "H" ? "RELION_HOME env" : "filesystem search"
+   552→    );
+   553→  }
+   554→
+   555→  // per-install fact lines "TAG:<dir>|<value>" (first "|" splits key/value)
+   556→  const facts = new Map<
+   557→    string,
+   558→    { version: string | null; mpirun: string | null; mpiBinary: boolean; ctffind: string | null }
+   559→  >();
+   560→  for (const l of lines) {
+   561→    if (l.length < 3 || l[1] !== ":") continue;
+   562→    const tag = l[0];
+   563→    if (tag !== "V" && tag !== "M" && tag !== "B" && tag !== "C") continue;
+   564→    const sep = l.indexOf("|");
+   565→    if (sep < 0) continue;
+   566→    const dir = l.slice(2, sep);
+   567→    const val = l.slice(sep + 1).trim();
+   568→    const f =
+   569→      facts.get(dir) ?? { version: null, mpirun: null, mpiBinary: false, ctffind: null };
+   570→    if (tag === "V") {
+   571→      const m = val.match(/RELION\s*(?:version)?[:\s]*v?(\d+\.\d+(?:\.\d+)?)/i);
+   572→      if (m) f.version = m[1];
+   573→    } else if (tag === "M") {
+   574→      if (val.startsWith("/")) f.mpirun = val.split("\n")[0];
+   575→    } else if (tag === "B") {
+   576→      f.mpiBinary = val === "yes";
+   577→    } else if (tag === "C") {
+   578→      if (val.startsWith("/")) f.ctffind = val.split("\n")[0];
+   579→    }
+   580→    facts.set(dir, f);
+   581→  }
+   582→
+   583→  // none found → honest, actionable guidance (NOT "WSL unavailable")
+   584→  if (found.size === 0) {
+   585→    const note = [
+   586→      `WSL distro "${distro ?? "default"}" is up, but RELION is not on its PATH and no common install layout matched.`,
+   587→      "If RELION IS installed inside WSL, expose it one of these ways, then press Re-detect:",
+   588→      "A) echo 'export PATH=/path/to/relion/bin:$PATH' >> ~/.bashrc   (login-shell probe picks this up)",
+   589→      "B) sudo ln -sf /path/to/relion/bin/relion* /usr/local/bin/",
+   590→      "C) echo 'export RELION_HOME=/path/to/relion' >> ~/.bashrc",
+   591→      "Searched automatically: ~/relion*/bin, ~/myproject/relion*/bin, ~/my-project/relion*/bin, ~/src|build|code/relion*/bin, /usr/local/relion*/bin, /opt/relion*/bin",
+   592→    ].join("\n");
+   593→    return { available: true, unavailableReason: null, distro, installs: [], note };
+   594→  }
+   595→
+   596→  // build one install entry per binDir — facts come from the same probe
+   597→  const installs: RelionInstall[] = [];
+   598→  for (const [binDir, meta] of [...found.entries()].slice(0, 8)) {
+   599→    const f = facts.get(binDir);
+   600→    installs.push({
+   601→      id: `w:${distro ?? "default"}:${binDir}`,
+   602→      version: f?.version ?? null,
+   603→      path: binDir,
+   604→      relionHome: binDir.replace(/\/bin\/?$/, ""),
+   605→      source: meta.source,
+   606→      // When the server itself runs inside the distro's filesystem the path
+   607→      // is directly spawnable → native; otherwise the WSL bridge executes it.
+   608→      execution: isValidBinDir(binDir) ? "native" : "wsl",
+   609→      distro,
+   610→      mpirunPath: f?.mpirun ?? null,
+   611→      mpiBinary: f?.mpiBinary ?? false,
+   612→      ctffindPath: f?.ctffind ?? null,
+   613→    });
+   614→  }
+   615→
+   616→  return {
+   617→    available: true,
+   618→    unavailableReason: null,
+   619→    distro,
+   620→    installs,
+   621→    note: "",
+   622→  };
+   623→}
+   624→
+   625→/* ------------------------------------------------------------------ */
+   626→/* Main entry point — snapshot persistence + stale-while-revalidate     */
+   627→/* ------------------------------------------------------------------ */
+   628→
+   629→let cache: { at: number; status: RelionStatus } | null = null;
+   630→// 10 minutes: a background re-probe costs one wsl.exe distro round-trip —
+   631→// frequent re-probes used to flash console windows on Windows hosts (one
+   632→// per wsl.exe spawn on runtimes where windowsHide is not fully honored) and
+   633→// fought the app for the distro while jobs were running. Re-detect (force)
+   634→// is the explicit escape hatch and stays instant.
+   635→const CACHE_MS = 600_000;
+   636→/** One shared in-flight full probe (force calls + background refresh). */
+   637→let probeLock: Promise<RelionStatus> | null = null;
+   638→/** Background re-verification kicked by the stale-while-revalidate path. */
+   639→let bgRefresh: Promise<void> | null = null;
+   640→
+   641→/** Compose the WslStatusClient the UI/bridge expect from a WSL probe. */
+   642→function wslStatusFrom(
+   643→  probe: WslProbe,
+   644→  selected: RelionInstall | null
+   645→): WslStatusClient {
+   646→  if (!probe.available) {
+   647→    return {
+   648→      available: false,
+   649→      unavailableReason: probe.unavailableReason,
+   650→      relionPath: null,
+   651→      relionHome: null,
+   652→      version: null,
+   653→      source: null,
+   654→      distro: null,
+   655→      note: probe.note,
+   656→    };
+   657→  }
+   658→  // mirror the SELECTED WSL install when one is active (bridge correctness),
+   659→  // otherwise the first discovery (UI guidance only)
+   660→  const install = selected ?? probe.installs[0] ?? null;
+   661→  if (!install) {
+   662→    return {
+   663→      available: true,
+   664→      unavailableReason: null,
+   665→      relionPath: null,
+   666→      relionHome: null,
+   667→      version: null,
+   668→      source: null,
+   669→      distro: probe.distro,
+   670→      note: probe.note,
+   671→    };
+   672→  }
+   673→  const note =
+   674→    install.source === "login-shell PATH"
+   675→      ? `RELION ${install.version ?? "?"} detected inside WSL (${install.distro ?? "default"}) at ${install.path} — on the distro's login-shell PATH.`
+   676→      : `RELION ${install.version ?? "?"} found inside WSL (${install.distro ?? "default"}) at ${install.path} via ${install.source} — not on the default PATH. For shell convenience add it to ~/.bashrc (option A in guidance below). The dashboard surfaces this install directly.`;
+   677→  return {
+   678→    available: true,
+   679→    unavailableReason: null,
+   680→    relionPath: install.path,
+   681→    relionHome: install.relionHome,
+   682→    version: install.version,
+   683→    source: install.source,
+   684→    distro: install.distro,
+   685→    note,
+   686→    mpirunPath: install.mpirunPath,
+   687→    mpiBinary: install.mpiBinary,
+   688→    ctffindPath: install.ctffindPath,
+   689→  };
+   690→}
+   691→
+   692→/** WSL block for a CACHED install: the distro did not respond this round, so
+   693→ *  the save-time verification is shown with an explicit restoration note. */
+   694→function wslStatusFromCached(
+   695→  install: RelionInstall,
+   696→  probe: WslProbe
+   697→): WslStatusClient {
+   698→  const reason = !probe.available
+   699→    ? probe.unavailableReason === "no-wsl"
+   700→      ? "wsl.exe is no longer resolvable on this host."
+   701→      : "WSL did not respond during this check (the distro may be cold — the first call boots it, which can take 10–30 s)."
+   702→    : "WSL responded, but this install was not re-discovered this round.";
+   703→  return {
+   704→    available: true,
+   705→    unavailableReason: null,
+   706→    relionPath: install.path,
+   707→    relionHome: install.relionHome,
+   708→    version: install.version,
+   709→    source: install.source,
+   710→    distro: install.distro,
+   711→    note: [
+   712→      `Restored from the saved last detection (data/relion-snapshot.json). ${reason}`,
+   713→      "It stays selectable and jobs still dispatch to it — the WSL bridge boots the distro on demand. Press Re-detect once WSL is running to re-verify.",
+   714→    ].join("\n"),
+   715→    mpirunPath: install.mpirunPath,
+   716→    mpiBinary: install.mpiBinary,
+   717→    ctffindPath: install.ctffindPath,
+   718→  };
+   719→}
+   720→
+   721→/** Partial binary/external truth for a CACHED install whose save-time
+   722→ *  verification block belongs to a DIFFERENT install: entries derivable from
+   723→ *  the install record itself (discovery required relion_refine[_mpi]; the
+   724→ *  MPI/ctffind columns were recorded) are shown, the rest stay unchecked. */
+   725→function cachedInstallBinaries(install: RelionInstall): {
+   726→  binaries: RelionStatus["binaries"];
+   727→  externals: RelionStatus["externals"];
+   728→} {
+   729→  const b = new Map(CORE_BINARIES.map((name) => [name, false]));
+   730→  b.set("relion_refine", true); // discovery itself required it (or _mpi)
+   731→  const e = new Map(EXTERNAL_PROGRAMS.map((name) => [name, false]));
+   732→  if (install.ctffindPath) e.set("ctffind", true);
+   733→  return {
+   734→    binaries: CORE_BINARIES.map((name) => ({ name, present: b.get(name) ?? false })),
+   735→    externals: EXTERNAL_PROGRAMS.map((name) => ({ name, present: e.get(name) ?? false })),
+   736→  };
+   737→}
+   738→
+   739→/** Run the FULL host + WSL probe, merge with the saved snapshot, persist. */
+   740→async function runProbe(): Promise<RelionStatus> {
+   741→  // ---- native installs (every valid candidate, deduped) ------------------
+   742→  const nativeCandidates = candidateDirs();
+   743→  const nativeMap = new Map<string, NativeCandidate>(); // canonical → candidate
+   744→  const onPath = await which("relion_refine", 3000);
+   745→  if (onPath && isValidBinDir(path.dirname(onPath))) {
+   746→    nativeMap.set(canonical(path.dirname(onPath)), {
+   747→      dir: path.dirname(onPath),
+   748→      source: "PATH",
+   749→    });
+   750→  }
+   751→  for (const cand of nativeCandidates) {
+   752→    if (isValidBinDir(cand.dir)) {
+   753→      const key = canonical(cand.dir);
+   754→      // PATH and RELION_HOME outrank scan hits for the same physical dir
+   755→      if (!nativeMap.has(key)) nativeMap.set(key, cand);
+   756→    }
+   757→  }
+   758→
+   759→  const nativeInstalls: RelionInstall[] = [];
+   760→  for (const cand of nativeMap.values()) {
+   761→    const version = await probeVersion(cand.dir);
+   762→    nativeInstalls.push({
+   763→      id: `n:${cand.dir}`,
+   764→      version,
+   765→      path: cand.dir,
+   766→      relionHome: cand.dir.replace(/\/bin\/?$/, ""),
+   767→      source: cand.source,
+   768→      execution: "native",
+   769→      distro: null,
+   770→      mpirunPath: null,
+   771→      mpiBinary: existsSync(path.join(cand.dir, "relion_refine_mpi")),
+   772→      ctffindPath: await resolveNativeCtffind(cand.dir),
+   773→    });
+   774→  }
+   775→
+   776→  // ---- WSL installs -------------------------------------------------------
+   777→  const wslProbe = await probeWsl();
+   778→  const wslInstalls = wslProbe.installs;
+   779→
+   780→  // ---- merge with the SAVED last detection --------------------------------
+   781→  // A failed WSL probe (cold VM) must never blank the environment: installs
+   782→  // saved earlier are restored (flagged `cached`) when they cannot be
+   783→  // disproved this round. Native ones re-verify on disk; WSL ones survive
+   784→  // exactly as long as the distro is unreachable — once it responds again,
+   785→  // anything it does not re-report is dropped for good.
+   786→  const snap = readSnapshot();
+   787→  const installs: RelionInstall[] = [...nativeInstalls, ...wslInstalls];
+   788→  const freshIds = new Set(installs.map((i) => i.id));
+   789→  let restored = 0;
+   790→  if (snap) {
+   791→    for (const old of snap.status.installs) {
+   792→      if (freshIds.has(old.id)) continue;
+   793→      const keep =
+   794→        old.execution === "native"
+   795→          ? isValidBinDir(old.path) // host fs visible → verify on disk
+   796→          : !wslProbe.available; // distro unreachable → cannot disprove
+   797→      if (keep) {
+   798→        installs.push({ ...old, cached: true });
+   799→        restored++;
+   800→      }
+   801→    }
+   802→  }
+   803→  if (restored > 0) {
+   804→    console.info(
+   805→      `[relion] fresh probe missed ${restored} install(s) — restored from the saved snapshot (marked cached)`
+   806→    );
+   807→  }
+   808→
+   809→  // ---- order + selection ---------------------------------------------------
+   810→  const persisted = readSelectedId();
+   811→  let selected =
+   812→    installs.find((i) => i.id === persisted) ?? null;
+   813→  let autoPicked = false;
+   814→  if (!selected) {
+   815→    selected = pickDefaultInstall(installs);
+   816→    if (selected) {
+   817→      autoPicked = true;
+   818→      writeSelectedId(selected.id);
+   819→    }
+   820→  }
+   821→
+   822→  // ---- top-level status mirrors the SELECTED install ------------------------
+   823→  const found = selected !== null;
+   824→  const execution: RelionStatus["execution"] = selected?.execution ?? null;
+   825→  const wsl =
+   826→    selected && selected.cached && selected.execution === "wsl"
+   827→      ? wslStatusFromCached(selected, wslProbe)
+   828→      : wslStatusFrom(
+   829→          wslProbe,
+   830→          selected && selected.execution === "wsl" ? selected : null
+   831→        );
+   832→
+   833→  let binaries: RelionStatus["binaries"];
+   834→  let externals: RelionStatus["externals"];
+   835→
+   836→  // per-install blocks for a RESTORED selection come from the snapshot (they
+   837→  // were verified inside the distro at save time) — but only when the
+   838→  // snapshot's selection is the same install, else stay honestly unverified
+   839→  const snapBlocks =
+   840→    snap && selected && selected.cached && snap.status.selectedId === selected.id
+   841→      ? snap.status
+   842→      : null;
+   843→
+   844→  if (selected && selected.execution === "wsl") {
+   845→    if (selected.cached && snapBlocks) {
+   846→      // WSL did not respond — restore the save-time verification blocks
+   847→      binaries = snapBlocks.binaries;
+   848→      externals = snapBlocks.externals;
+   849→    } else if (selected.cached) {
+   850→      // different install than the snapshot's save-time selection — derive
+   851→      // what the install record itself proves
+   852→      const partial = cachedInstallBinaries(selected);
+   853→      binaries = partial.binaries;
+   854→      externals = partial.externals;
+   855→    } else {
+   856→      // binaries verified INSIDE the distro (host existsSync can't see them)
+   857→      const wslPath = await locateWslExe();
+   858→      if (wslPath) {
+   859→        const inWsl = await probeWslBinaries(
+   860→          wslPath,
+   861→          selected.path,
+   862→          CORE_BINARIES,
+   863→          EXTERNAL_PROGRAMS
+   864→        );
+   865→        binaries = CORE_BINARIES.map((name) => ({ name, present: inWsl.bins.has(name) }));
+   866→        externals = EXTERNAL_PROGRAMS.map((name) => ({ name, present: inWsl.exts.has(name) }));
+   867→      } else {
+   868→        binaries = CORE_BINARIES.map((name) => ({ name, present: false }));
+   869→        externals = EXTERNAL_PROGRAMS.map((name) => ({ name, present: false }));
+   870→      }
+   871→    }
+   872→  } else {
+   873→    const dir = selected?.path ?? null;
+   874→    binaries = CORE_BINARIES.map((name) => ({
+   875→      name,
+   876→      present: dir ? existsSync(path.join(dir, name)) : false,
+   877→    }));
+   878→    externals = [];
+   879→    for (const name of EXTERNAL_PROGRAMS) {
+   880→      let present = (await which(name, 2000)) !== null;
+   881→      if (!present && dir) {
+   882→        present = existsSync(path.join(dir, name));
+   883→      }
+   884→      // ctffind: the selected install may resolve a bundled deps copy
+   885→      // (resolveNativeCtffind: PATH → bin dir → deps) that the engine
+   886→      // actually passes to CTF jobs — the panel must not contradict it
+   887→      if (!present && name === "ctffind" && selected?.ctffindPath) {
+   888→        present = true;
+   889→      }
+   890→      externals.push({ name, present });
+   891→    }
+   892→  }
+   893→
+   894→  const source = selected
+   895→    ? (selected.execution === "wsl"
+   896→        ? selected.distro
+   897→          ? `WSL (${selected.distro}) · ${selected.source}`
+   898→          : `WSL · ${selected.source}`
+   899→        : selected.source) + (selected.cached ? " · saved" : "")
+   900→    : null;
+   901→
+   902→  const status: RelionStatus = {
+   903→    found,
+   904→    execution,
+   905→    version: selected?.version ?? null,
+   906→    path: selected?.path ?? null,
+   907→    source,
+   908→    wsl,
+   909→    binaries,
+   910→    externals,
+   911→    checkedAt: new Date().toISOString(),
+   912→    // multi-install surface (all versions found + the active one)
+   913→    installs,
+   914→    selectedId: selected?.id ?? null,
+   915→    autoPicked,
+   916→  };
+   917→
+   918→  writeSnapshot(status);
+   919→  cache = { at: Date.now(), status };
+   920→  return status;
+   921→}
+   922→
+   923→/** One shared full probe (dedups concurrent force calls + background refresh). */
+   924→function fullProbe(): Promise<RelionStatus> {
+   925→  if (!probeLock) {
+   926→    probeLock = runProbe()
+   927→      .catch((err) => {
+   928→        // probe crashed — never take the app down with it: fall back to the
+   929→        // last in-memory status, else the saved snapshot, else rethrow
+   930→        if (cache) return cache.status;
+   931→        const snap = readSnapshot();
+   932→        if (snap) {
+   933→          const status: RelionStatus = { ...snap.status, fromCache: true };
+   934→          cache = { at: Date.now(), status };
+   935→          return status;
+   936→        }
+   937→        throw err;
+   938→      })
+   939→      .finally(() => {
+   940→        probeLock = null;
+   941→      });
+   942→  }
+   943→  return probeLock;
+   944→}
+   945→
+   946→/** Fire-and-forget background re-verification (stale-while-revalidate). */
+   947→function kickBackgroundRefresh(): void {
+   948→  if (bgRefresh) return;
+   949→  bgRefresh = (async () => {
+   950→    try {
+   951→      await fullProbe();
+   952→    } catch (err) {
+   953→      console.error("[relion] background re-detect failed:", err);
+   954→    } finally {
+   955→      bgRefresh = null;
+   956→    }
+   957→  })();
+   958→}
+   959→
+   960→export async function detectRelion(force = false): Promise<RelionStatus> {
+   961→  if (!force) {
+   962→    // Serve instantly from the in-module cache …
+   963→    if (cache) {
+   964→      if (Date.now() - cache.at < CACHE_MS) return cache.status;
+   965→      // … or STALE, while a background probe re-verifies — callers never wait.
+   966→      kickBackgroundRefresh();
+   967→      return cache.status;
+   968→    }
+   969→    // Cold start (server restart / first import): the SAVED detection
+   970→    // answers immediately — no re-detect needed just because the app was
+   971→    // reopened; the background probe refreshes it in place.
+   972→    const snap = readSnapshot();
+   973→    if (snap) {
+   974→      const status: RelionStatus = { ...snap.status, fromCache: true };
+   975→      cache = { at: Date.now(), status };
+   976→      kickBackgroundRefresh();
+   977→      return status;
+   978→    }
+   979→  }
+   980→  // force (Re-detect button / install switch) or nothing ever detected yet
+   981→  return fullProbe();
+   982→}
+   983→
+   984→/**
+   985→ * Switch the active RELION install. Validates against a fresh probe, persists
+   986→ * the choice (survives restarts), and refreshes the cache. Returns the new
+   987→ * status. Selecting an unknown id → HTTP-level callers report 404 upstream.
+   988→ */
+   989→export async function selectRelionInstall(
+   990→  installId: string
+   991→): Promise<{ ok: boolean; status: RelionStatus }> {
+   992→  const status = await detectRelion(true);
+   993→  const target = status.installs.find((i) => i.id === installId);
+   994→  if (!target) {
+   995→    return { ok: false, status };
+   996→  }
+   997→  if (status.selectedId === installId) {
+   998→    return { ok: true, status };
+   999→  }
+  1000→  writeSelectedId(installId);
+  1001→  const refreshed = await detectRelion(true);
+  1002→  return { ok: true, status: refreshed };
+  1003→}
+  1004→
+  1005→

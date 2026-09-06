@@ -1,0 +1,2002 @@
+     1→/**
+     2→ * CryoFlow — REAL RELION 5 execution engine (SERVER ONLY).
+     3→ *
+     4→ * Spawns the actual RELION CLI programs (command shapes extracted from
+     5→ * /home/z/relion-build/pipeline_jobs.cpp — RELION 5.0.1 getCommands* builders).
+     6→ * Engine state (pid / workdir / log / outputs) lives in data/engine-state.json
+     7→ * so it survives Next.js dev-server hot reloads (the Prisma schema is frozen).
+     8→ *
+     9→ * Three job classes:
+    10→ *  - engine-native (import / manualpick / select): no RELION binary needed,
+    11→ *    writes RELION-5 style STAR files directly.
+    12→ *  - real CLI jobs: spawn relion_* binaries with faithful argv.
+    13→ *  - external jobs: honest failure when the external binary is absent.
+    14→ */
+    15→
+    16→import type { ChildProcess } from "child_process";
+    17→import { execFile, execFileSync, spawn } from "child_process";
+    18→import {
+    19→  appendFileSync,
+    20→  closeSync,
+    21→  existsSync,
+    22→  linkSync,
+    23→  mkdirSync,
+    24→  openSync,
+    25→  readdirSync,
+    26→  readFileSync,
+    27→  readSync,
+    28→  realpathSync,
+    29→  rmSync,
+    30→  statSync,
+    31→  symlinkSync,
+    32→  writeFileSync,
+    33→} from "fs";
+    34→import path from "path";
+    35→import type { Job } from "@prisma/client";
+    36→import { db } from "@/lib/db";
+    37→import { DATA_DIR } from "@/lib/paths";
+    38→import { detectRelion } from "./system";
+    39→import { MIC_RE, expandPattern, hasWildcard, userPathToHost } from "./glob";
+    40→import { writePathrefMarker } from "./pathref";
+    41→import {
+    42→  binJoin,
+    43→  bridgeFromStatus,
+    44→  hostToWsl,
+    45→  isWindowsPath,
+    46→  wslStopArgs,
+    47→  wrapWslCommand,
+    48→  type WslBridge,
+    49→} from "./wsl-bridge";
+    50→import {
+    51→  applySymmetryToEuler,
+    52→  deduplicateRotations,
+    53→  describeRotations,
+    54→  eulerToDirection,
+    55→  generatePointGroup,
+    56→  type Mat3,
+    57→  type PointGroupSpec,
+    58→} from "@/lib/symmetry";
+    59→import {
+    60→  runRebalanceCore,
+    61→  type ExclusionCriterion,
+    62→  type RebalanceParams,
+    63→  type RebalanceReport,
+    64→  type RebParticle,
+    65→} from "./rebalance-core";
+    66→
+    67→/* ------------------------------------------------------------------ */
+    68→/* Paths & constants                                                    */
+    69→/* ------------------------------------------------------------------ */
+    70→
+    71→const STATE_FILE = path.join(DATA_DIR, "engine-state.json");
+    72→const RELION_ROOT = path.join(DATA_DIR, "relion");
+    73→/** Sandbox-only demo source (EMPIAR seed); user machines use the import
+    74→ * job's micrographsPath param (folder / wildcard pattern / file list) instead. */
+    75→const EMPIAR_DIR = "/home/z/empiar-10017/micrographs";
+    76→const MPICH_BIN = "/home/z/relion-build/deps/mpich/bin";
+    77→const MPICH_LIB = "/home/z/relion-build/deps/mpich/lib";
+    78→const FFTW_LIB = "/home/z/relion-build/deps/fftw/lib";
+    79→const CTFFIND_EXE = "/home/z/relion-build/deps/ctffind/bin/ctffind";
+    80→
+    81→const MPI_PARALLEL_TYPES = new Set(["class3d", "refine3d"]);
+    82→
+    83→/* ------------------------------------------------------------------ */
+    84→/* Types                                                                */
+    85→/* ------------------------------------------------------------------ */
+    86→
+    87→export interface RunRecord {
+    88→  jobId: string;
+    89→  projectId: string;
+    90→  type: string;
+    91→  pid: number | null;
+    92→  cmd: string;
+    93→  workdir: string;
+    94→  logFile: string;
+    95→  errFile: string;
+    96→  startedAt: string;
+    97→  outputs: Record<string, string>;
+    98→  done: boolean;
+    99→  exitCode: number | null;
+   100→  result?: string | null;
+   101→}
+   102→
+   103→export interface EngineJobRef {
+   104→  id: string;
+   105→  projectId: string;
+   106→  type: string;
+   107→  params: Record<string, number | string | boolean>;
+   108→}
+   109→
+   110→export interface UpstreamRef {
+   111→  id: string;
+   112→  type: string;
+   113→  params?: Record<string, number | string | boolean>;
+   114→  /** DB status of the upstream job (idle | pending | running | completed | failed)
+   115→   * — powers the differentiated waiting messages. */
+   116→  status?: string;
+   117→  /** Display name (e.g. "Import · EMPIAR-10017") for waiting messages. */
+   118→  name?: string;
+   119→}
+   120→
+   121→/** Why a job could not start yet — maps to the PENDING status, not failed. */
+   122→export type WaitKind = "upstream-failed" | "upstream-running" | "not-ready";
+   123→
+   124→export interface RunOutcome {
+   125→  ok: boolean;
+   126→  /** true when the job completed synchronously (engine-native). */
+   127→  native?: boolean;
+   128→  pid?: number;
+   129→  error?: string;
+   130→  result?: string;
+   131→  /** Set when the job cannot start because an UPSTREAM job failed or is
+   132→   * still running — the dispatcher marks the job pending instead of
+   133→   * failed (no cascade of red jobs down the whole pipeline). */
+   134→  waiting?: WaitKind;
+   135→  /** Set when an interrupted refine-family run was resumed via --continue
+   136→   * (the iteration number it picked up from). */
+   137→  resumedFrom?: number;
+   138→}
+   139→
+   140→/** Live child processes (lost on server restart — reconcile handles that). */
+   141→const live = new Map<string, ChildProcess>();
+   142→
+   143→/* ------------------------------------------------------------------ */
+   144→/* State file                                                           */
+   145→/* ------------------------------------------------------------------ */
+   146→
+   147→export function readRuns(): Record<string, RunRecord> {
+   148→  // mtime-keyed cache: EVERY polled route (jobs GET, log, outputs, particles,
+   149→  // …) used to re-read + re-JSON.parse the whole state file on every call —
+   150→  // the file grows with every job ever run and the parse ran on the hot 2–5 s
+   151→  // poll path. writeRuns bumps the mtime so writers are always consistent.
+   152→  try {
+   153→    const st = statSync(STATE_FILE);
+   154→    if (runsCache && runsCache.mtime === st.mtimeMs && runsCache.size === st.size) {
+   155→      return runsCache.value;
+   156→    }
+   157→    const parsed = JSON.parse(readFileSync(STATE_FILE, "utf8"));
+   158→    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+   159→      const value = parsed as Record<string, RunRecord>;
+   160→      runsCache = { mtime: st.mtimeMs, size: st.size, value };
+   161→      return value;
+   162→    }
+   163→  } catch {
+   164→    // ENOENT / corrupt → fresh state
+   165→    runsCache = null;
+   166→  }
+   167→  return {};
+   168→}
+   169→
+   170→let runsCache: { mtime: number; size: number; value: Record<string, RunRecord> } | null = null;
+   171→
+   172→export function writeRuns(map: Record<string, RunRecord>): void {
+   173→  mkdirSync(DATA_DIR, { recursive: true });
+   174→  writeFileSync(STATE_FILE, JSON.stringify(map, null, 2));
+   175→  // invalidate immediately — the writer knows the truth; the next read
+   176→  // re-stats and re-populates (also covers EXTERNAL writers, which change
+   177→  // the mtime/size and bust the cache naturally)
+   178→  runsCache = null;
+   179→}
+   180→
+   181→export function getRun(jobId: string): RunRecord | null {
+   182→  return readRuns()[jobId] ?? null;
+   183→}
+   184→
+   185→/**
+   186→ * Forget a job's run record (used by the explicit user reset). The next
+   187→ * run then starts FRESH instead of resuming from a leftover checkpoint —
+   188→ * "Reset & edit" semantically means "discard this run".
+   189→ */
+   190→export function clearRunRecord(jobId: string): void {
+   191→  const runs = readRuns();
+   192→  if (!(jobId in runs)) return;
+   193→  delete runs[jobId];
+   194→  writeRuns(runs);
+   195→}
+   196→
+   197→/**
+   198→ * Number of live RELION child processes this server instance is still
+   199→ * tracking (used by the dispatcher's auto-start stampede guard — see
+   200→ * autoStartPendingDownstream).
+   201→ */
+   202→export function liveRunCount(): number {
+   203→  let n = 0;
+   204→  for (const child of live.values()) {
+   205→    if (child.exitCode === null && child.pid != null && pidAlive(child.pid)) n += 1;
+   206→  }
+   207→  return n;
+   208→}
+   209→
+   210→/**
+   211→ * Non-null when a live child process is still tracked for this job —
+   212→ * either through this server instance's `live` map, or via /proc on a
+   213→ * record written before a hot reload / server restart. The run route
+   214→ * uses this to refuse duplicate spawns (two mpirun trees writing to the
+   215→ * same workdir = corrupt checkpoints + an OOM on this 4GB box).
+   216→ * Returns a human-readable reason, or null when nothing is running.
+   217→ */
+   218→export function isRunAlive(jobId: string): string | null {
+   219→  const child = live.get(jobId);
+   220→  if (child && child.exitCode === null && child.pid != null && pidAlive(child.pid)) {
+   221→    return `job is already running (pid ${child.pid})`;
+   222→  }
+   223→  const state = readRuns()[jobId];
+   224→  if (state && state.done === false && state.pid != null && pidAlive(state.pid)) {
+   225→    return `job is already running (pid ${state.pid})`;
+   226→  }
+   227→  return null;
+   228→}
+   229→
+   230→/** All descendant pids of `pid` (mpirun → hydra → ranks), via /proc stat. */
+   231→function descendantsOf(pid: number): number[] {
+   232→  const ppidOf = new Map<number, number>();
+   233→  try {
+   234→    for (const entry of readdirSync("/proc")) {
+   235→      if (!/^\d+$/.test(entry)) continue;
+   236→      const p = Number(entry);
+   237→      if (p === pid) continue;
+   238→      try {
+   239→        const stat = readFileSync(`/proc/${p}/stat`, "utf8");
+   240→        const close = stat.lastIndexOf(")");
+   241→        // fields after "comm": state, ppid, ... → ppid is rest[1]
+   242→        const rest = stat.slice(close + 2).split(" ");
+   243→        const ppid = Number(rest[1]);
+   244→        if (Number.isFinite(ppid)) ppidOf.set(p, ppid);
+   245→      } catch {
+   246→        /* process vanished */
+   247→      }
+   248→    }
+   249→  } catch {
+   250→    return [];
+   251→  }
+   252→  const out: number[] = [];
+   253→  const queue = [pid];
+   254→  while (queue.length > 0) {
+   255→    const parent = queue.shift() as number;
+   256→    for (const [p, pp] of ppidOf) {
+   257→      if (pp === parent && !out.includes(p)) {
+   258→        out.push(p);
+   259→        queue.push(p);
+   260→      }
+   261→    }
+   262→  }
+   263→  return out;
+   264→}
+   265→
+   266→/** Cross-platform pid liveness: /proc on Linux, signal-0 probe on Windows. */
+   267→function pidAlive(pid: number): boolean {
+   268→  try {
+   269→    if (existsSync("/proc")) return existsSync(`/proc/${pid}`);
+   270→  } catch {
+   271→    /* fall through to the signal probe */
+   272→  }
+   273→  try {
+   274→    process.kill(pid, 0);
+   275→    return true;
+   276→  } catch (e) {
+   277→    // EPERM = the process EXISTS but belongs to another session/user
+   278→    // (e.g. a detached wsl.exe after a dev-server restart) — still alive.
+   279→    // ESRCH (or anything else) = gone.
+   280→    const err = e as NodeJS.ErrnoException;
+   281→    return err.code === "EPERM";
+   282→  }
+   283→}
+   284→
+   285→/**
+   286→ * Stop a job's live process tree (SIGTERM → grace → SIGKILL).
+   287→ *  - kills mpirun AND its ranks (a bare mpirun kill orphans the ranks)
+   288→ *  - if the child is in `live`, its exit handler fires and records
+   289→    exit −1 → the next POST /run can --continue from the checkpoint
+   290→ *  - for restart-orphaned trees (no live child, only a state record)
+   291→    the record is marked interrupted directly
+   292→ * Returns what happened, for the API response.
+   293→ */
+   294→export async function stopRun(jobId: string): Promise<{ stopped: boolean; message: string }> {
+   295→  const child = live.get(jobId);
+   296→  const state = readRuns()[jobId];
+   297→  const pid = child?.pid ?? state?.pid ?? null;
+   298→
+   299→  // ---- WSL bridge runs --------------------------------------------------
+   300→  // The host-side pid is the wsl.exe session host; the distro-internal
+   301→  // mpirun/rank tree has no /proc entries on Windows. Kill the host session
+   302→  // AND pkill the distro side by the translated workdir (always embedded in
+   303→  // the RELION argv via --o / --i), so no orphan keeps writing checkpoints.
+   304→  //
+   305→  // BRIDGE-NESS COMES FROM THE RECORD, not from the live detection state:
+   306→  // the wrapped display command starts with "wsl" / "wsl -d <distro> --" —
+   307→  // relying on detectRelion() here made stopping impossible exactly when
+   308→  // detection was stale/failed while the job kept running.
+   309→  const bridged =
+   310→    state?.cmd?.match(/^wsl(?: -d (\S+))? -- bash -c /) ?? null;
+   311→  if (pid != null && state?.workdir && pidAlive(pid) && bridged) {
+   312→    const distro = bridged[1] ?? null;
+   313→    try {
+   314→      process.kill(pid);
+   315→    } catch {
+   316→      /* already gone */
+   317→    }
+   318→    execFile("wsl.exe", wslStopArgs(state.workdir, distro), { timeout: 5000, windowsHide: true }, () => {
+   319→      /* best effort — pkill exits non-zero when nothing matched */
+   320→    });
+   321→    if (!child) {
+   322→      const runs = readRuns();
+   323→      const rec = runs[jobId];
+   324→      if (rec && rec.done === false) {
+   325→        runs[jobId] = { ...rec, done: true, exitCode: -1, result: "stopped by user (WSL bridge)" };
+   326→        writeRuns(runs);
+   327→      }
+   328→    }
+   329→    return {
+   330→      stopped: true,
+   331→      message: `stopped WSL session pid ${pid} (pkill sent inside ${distro ?? "default distro"})`,
+   332→    };
+   333→  }
+   334→
+   335→  const tree = pid != null && existsSync(`/proc/${pid}`) ? [pid, ...descendantsOf(pid)] : [];
+   336→
+   337→  if (tree.length === 0) {
+   338→    // Windows native fallback: no /proc tree exists, but the pid is alive
+   339→    // (a non-bridged record on a win32 host). process.kill() terminates
+   340→    // unconditionally there — no graceful SIGTERM, but the job stops.
+   341→    if (pid != null && pidAlive(pid) && process.platform === "win32") {
+   342→      try {
+   343→        process.kill(pid);
+   344→      } catch {
+   345→        /* raced away */
+   346→      }
+   347→      return { stopped: true, message: `stopped pid ${pid} (Windows terminate)` };
+   348→    }
+   349→    return { stopped: false, message: "no live process for this job" };
+   350→  }
+   351→
+   352→  for (const p of tree) {
+   353→    try {
+   354→      process.kill(p, "SIGTERM");
+   355→    } catch {
+   356→      /* already gone */
+   357→    }
+   358→  }
+   359→  // graceful window: RELION ranks exit on SIGTERM, mpirun reaps them
+   360→  const graceDeadline = Date.now() + 5000;
+   361→  while (Date.now() < graceDeadline) {
+   362→    await new Promise((r) => setTimeout(r, 250));
+   363→    if (!tree.some((p) => pidAlive(p))) break;
+   364→  }
+   365→  let killed = 0;
+   366→  for (const p of tree) {
+   367→    if (pidAlive(p)) {
+   368→      try {
+   369→        process.kill(p, "SIGKILL");
+   370→        killed += 1;
+   371→      } catch {
+   372→        /* raced away */
+   373→      }
+   374→    }
+   375→  }
+   376→
+   377→  // If the exit handler won't fire (child not in `live` — e.g. the tree
+   378→  // survived a server restart), mark the record interrupted ourselves so
+   379→  // reconcile + the resume branch see a consistent state.
+   380→  if (!child) {
+   381→    const runs = readRuns();
+   382→    const rec = runs[jobId];
+   383→    if (rec && rec.done === false) {
+   384→      runs[jobId] = { ...rec, done: true, exitCode: -1, result: "stopped by user" };
+   385→      writeRuns(runs);
+   386→    }
+   387→  }
+   388→  return {
+   389→    stopped: true,
+   390→    message: `stopped pid ${pid} (${tree.length} processes${killed > 0 ? `, ${killed} SIGKILLed` : ""})`,
+   391→  };
+   392→}
+   393→
+   394→/* ------------------------------------------------------------------ */
+   395→/* Environment                                                          */
+   396→/* ------------------------------------------------------------------ */
+   397→
+   398→/** Environment for spawning RELION binaries (PATH + libs + RELION_HOME). */
+   399→export function relionEnv(binDir: string): NodeJS.ProcessEnv {
+   400→  const pathParts: string[] = [binDir];
+   401→  if (existsSync(MPICH_BIN)) pathParts.push(MPICH_BIN);
+   402→  const libParts = [MPICH_LIB, FFTW_LIB].filter((p) => existsSync(p));
+   403→  const env: NodeJS.ProcessEnv = {
+   404→    ...process.env,
+   405→    // path.delimiter (";" on Windows, ":" on POSIX) — a hardcoded ":" would
+   406→    // corrupt PATH on native Windows runs
+   407→    PATH: pathParts.join(path.delimiter) + path.delimiter + (process.env.PATH ?? ""),
+   408→    RELION_HOME: binDir.replace(/\/bin\/?$/, ""),
+   409→  };
+   410→  // relion_run_ctffind does NOT search PATH — it needs an explicit executable
+   411→  if (existsSync(CTFFIND_EXE)) env.RELION_CTFFIND_EXECUTABLE = CTFFIND_EXE;
+   412→  // OpenMPI 4+ refuses mpirun as root (app itself running as root on a Linux
+   413→  // host with an OpenMPI toolchain). Upstream-sanctioned opt-in pair; MPICH
+   414→  // (sandbox) ignores them — harmless everywhere, inert for non-root users.
+   415→  env.OMPI_ALLOW_RUN_AS_ROOT = "1";
+   416→  env.OMPI_ALLOW_RUN_AS_ROOT_CONFIRM = "1";
+   417→  env.LD_LIBRARY_PATH =
+   418→    libParts.length > 0
+   419→      ? libParts.join(":") + ":" + (process.env.LD_LIBRARY_PATH ?? "")
+   420→      : (process.env.LD_LIBRARY_PATH ?? "");
+   421→  return env;
+   422→}
+   423→
+   424→function workdirFor(job: EngineJobRef): string {
+   425→  return path.join(RELION_ROOT, job.projectId, `${job.type}_${job.id.slice(-8)}`);
+   426→}
+   427→
+   428→/**
+   429→ * RELION "project root" directory — all real CLI jobs run with this as CWD
+   430→ * (mirrors how the RELION GUI/pipeliner launches jobs from the pipeline root),
+   431→ * so STAR files can use project-relative micrograph paths. ctffind_runner
+   432→ * symlinks micrographs as (cwd + star-path) → output-dir + path, which only
+   433→ * resolves when CWD is this directory.
+   434→ */
+   435→function projectDirFor(job: EngineJobRef): string {
+   436→  return path.join(RELION_ROOT, job.projectId);
+   437→}
+   438→
+   439→/* ------------------------------------------------------------------ */
+   440→/* Toolchain resolution (native sandbox MPICH vs WSL distro tools)      */
+   441→/* ------------------------------------------------------------------ */
+   442→
+   443→/** mpirun for MPI-parallel types: distro-side (bridge) or sandbox MPICH. */
+   444→function resolveMpirun(binDir: string, bridge: WslBridge | null): string | null {
+   445→  if (bridge) return bridge.mpirun;
+   446→  return existsSync(path.join(MPICH_BIN, "mpirun"))
+   447→    ? path.join(MPICH_BIN, "mpirun")
+   448→    : null;
+   449→}
+   450→
+   451→/** relion_refine_mpi presence (WSL-side facts come from the probe). */
+   452→function hasMpiBinary(binDir: string, bridge: WslBridge | null): boolean {
+   453→  if (bridge) return bridge.hasMpiBinary;
+   454→  return existsSync(path.join(binDir, "relion_refine_mpi"));
+   455→}
+   456→
+   457→/** ctffind executable: distro-side (bridge) or the sandbox bundle. */
+   458→function resolveCtffind(bridge: WslBridge | null): string | null {
+   459→  if (bridge) return bridge.ctffind;
+   460→  return existsSync(CTFFIND_EXE) ? CTFFIND_EXE : null;
+   461→}
+   462→
+   463→/**
+   464→ * Link a data directory into the RELION project/job tree so STAR files can
+   465→ * use project-relative "micrographs/<name>" paths (RELION pipeliner style).
+   466→ * POSIX hosts get a symlink; Windows gets a directory JUNCTION (no admin
+   467→ * rights needed — plain symlinks require Developer Mode there). Returns
+   468→ * false when no link could be created (e.g. junction to a UNC target).
+   469→ */
+   470→function linkDirInto(target: string, linkPath: string): boolean {
+   471→  try {
+   472→    if (existsSync(linkPath)) {
+   473→      // a previous import may point elsewhere — re-point the link
+   474→      try {
+   475→        if (realpathSync(linkPath) === realpathSync(target)) return true;
+   476→        rmSync(linkPath, { force: true, recursive: true });
+   477→      } catch {
+   478→        /* stale/broken link — remove and recreate below */
+   479→        try {
+   480→          rmSync(linkPath, { force: true, recursive: true });
+   481→        } catch {
+   482→          /* cannot clean up — keep the old link and fail honestly */
+   483→          return false;
+   484→        }
+   485→      }
+   486→    }
+   487→    if (process.platform === "win32") {
+   488→      symlinkSync(target, linkPath, "junction");
+   489→    } else {
+   490→      symlinkSync(target, linkPath, "dir");
+   491→    }
+   492→    return true;
+   493→  } catch {
+   494→    return false;
+   495→  }
+   496→}
+   497→
+   498→/**
+   499→ * De-duplicate a STAR entry name for file-set imports. Collisions get the
+   500→ * parent folder as a prefix (MovieDir__frame.mrc), then -2, -3… suffixes.
+   501→ */
+   502→function uniqueStarName(file: string, used: Set<string>): string {
+   503→  let name = path.basename(file);
+   504→  if (used.has(name)) {
+   505→    const ext = path.extname(name);
+   506→    const stem = name.slice(0, name.length - ext.length);
+   507→    const parent = path.basename(path.dirname(file)) || "src";
+   508→    name = `${parent}__${stem}${ext}`;
+   509→    let i = 2;
+   510→    while (used.has(name)) {
+   511→      name = `${parent}__${stem}-${i}${ext}`;
+   512→      i += 1;
+   513→    }
+   514→  }
+   515→  used.add(name);
+   516→  return name;
+   517→}
+   518→
+   519→/**
+   520→ * Import a SET of files (multi-select / wildcard pattern / single file):
+   521→ * create a real "micrographs" directory in the project tree and link every
+   522→ * file into it — hardlink first (no data duplication, works on POSIX and
+   523→ * NTFS), then a file symlink, then absolute STAR paths as honest fallback
+   524→ * (translated to WSL-side paths when the bridge is active).
+   525→ * Unlinkable files additionally get a .pathref marker so the gallery/preview
+   526→ * routes can still serve them from their source location — without the
+   527→ * marker an absolute-path import LOOKS like "nothing was imported" even
+   528→ * though the STAR file references every file correctly.
+   529→ * Returns the STAR entries + how many files could NOT be linked.
+   530→ */
+   531→function importFileSet(
+   532→  hostFiles: string[],
+   533→  projectDir: string,
+   534→  workdir: string,
+   535→  bridge: WslBridge | null
+   536→): { entries: string[]; unlinked: number } {
+   537→  const projectMic = path.join(projectDir, "micrographs");
+   538→  const workdirMic = path.join(workdir, "micrographs");
+   539→  // fresh real dir — removes a previous import's symlink/junction (the link
+   540→  // only, never the target data) or an older file-set's hardlinks
+   541→  for (const stale of [workdirMic, projectMic]) {
+   542→    try {
+   543→      rmSync(stale, { force: true, recursive: true });
+   544→    } catch {
+   545→      /* non-fatal: linkDirInto below re-points what it can */
+   546→    }
+   547→  }
+   548→  mkdirSync(projectMic, { recursive: true });
+   549→
+   550→  const used = new Set<string>();
+   551→  const entries: string[] = [];
+   552→  /** unlinkable files: name → source, for pathref markers */
+   553→  const unlinkedFiles: { name: string; abs: string }[] = [];
+   554→  for (const f of hostFiles) {
+   555→    const name = uniqueStarName(f, used);
+   556→    const target = path.join(projectMic, name);
+   557→    let linked = false;
+   558→    try {
+   559→      linkSync(f, target); // hardlink — same filesystem only
+   560→      linked = true;
+   561→    } catch {
+   562→      try {
+   563→        symlinkSync(f, target, "file");
+   564→        linked = true;
+   565→      } catch {
+   566→        linked = false; // cross-volume + no symlink rights → absolute path
+   567→      }
+   568→    }
+   569→    if (linked) {
+   570→      entries.push(`micrographs/${name}`);
+   571→    } else {
+   572→      unlinkedFiles.push({ name, abs: f });
+   573→      entries.push(bridge ? hostToWsl(f) : f);
+   574→    }
+   575→  }
+   576→  // expose the set inside the import job's workdir (Files tab + gallery)
+   577→  if (!linkDirInto(projectMic, workdirMic)) {
+   578→    // junction failed — link each file directly into the workdir instead
+   579→    for (const e of entries) {
+   580→      if (!e.startsWith("micrographs/")) continue;
+   581→      const src = path.join(projectMic, e.slice("micrographs/".length));
+   582→      const dst = path.join(workdirMic, e.slice("micrographs/".length));
+   583→      try {
+   584→        mkdirSync(path.dirname(dst), { recursive: true });
+   585→        linkSync(src, dst);
+   586→      } catch {
+   587→        try {
+   588→          mkdirSync(path.dirname(dst), { recursive: true });
+   589→          symlinkSync(src, dst, "file");
+   590→        } catch {
+   591→          /* gallery preview lost for this file — import still works */
+   592→        }
+   593→      }
+   594→    }
+   595→  }
+   596→  // markers for the unlinkable files (both trees — the junction case only
+   597→  // carries projectMic's markers into the workdir automatically)
+   598→  for (const u of unlinkedFiles) {
+   599→    writePathrefMarker(projectMic, u.name, u.abs);
+   600→    try {
+   601→      mkdirSync(workdirMic, { recursive: true });
+   602→      writePathrefMarker(workdirMic, u.name, u.abs);
+   603→    } catch {
+   604→      /* workdir marker is best-effort */
+   605→    }
+   606→  }
+   607→  return { entries, unlinked: unlinkedFiles.length };
+   608→}
+   609→
+   610→/* ------------------------------------------------------------------ */
+   611→/* Param helpers                                                        */
+   612→/* ------------------------------------------------------------------ */
+   613→
+   614→function num(job: EngineJobRef, key: string, fallback: number): number {
+   615→  const v = job.params[key];
+   616→  const n = typeof v === "number" ? v : parseFloat(String(v ?? ""));
+   617→  return Number.isFinite(n) ? n : fallback;
+   618→}
+   619→
+   620→function str(job: EngineJobRef, key: string, fallback: string): string {
+   621→  const v = job.params[key];
+   622→  return v === undefined || v === null ? fallback : String(v);
+   623→}
+   624→
+   625→function flag(job: EngineJobRef, key: string): boolean {
+   626→  return String(job.params[key] ?? "false") === "true";
+   627→}
+   628→
+   629→/** Micrograph pixel size from the pipeline's Import job (Å). */
+   630→function micAngpix(upstream: UpstreamRef[]): number | null {
+   631→  const importUp = upstream.find((u) => u.type === "import");
+   632→  return importUp?.params && typeof importUp.params.pixelSize === "number"
+   633→    ? importUp.params.pixelSize
+   634→    : null;
+   635→}
+   636→
+   637→/** Particle pixel size: import pixel × (extract box / downsample). */
+   638→function particlePixel(job: EngineJobRef, upstream: UpstreamRef[]): number {
+   639→  const importUp = upstream.find((u) => u.type === "import" || u.type === "tomo_import");
+   640→  const extractUp = upstream.find((u) => u.type === "extract");
+   641→  const pixel =
+   642→    importUp?.params && typeof importUp.params.pixelSize === "number"
+   643→      ? importUp.params.pixelSize
+   644→      : 1.77;
+   645→  if (extractUp?.params) {
+   646→    const box = typeof extractUp.params.boxSize === "number" ? extractUp.params.boxSize : 128;
+   647→    const down =
+   648→      typeof extractUp.params.downsampleTo === "number" ? extractUp.params.downsampleTo : 0;
+   649→    if (down > 0 && down < box) return (pixel * box) / down;
+   650→  }
+   651→  return pixel;
+   652→}
+   653→
+   654→/* ------------------------------------------------------------------ */
+   655→/* Input resolution (upstream runs' outputs)                            */
+   656→/* ------------------------------------------------------------------ */
+   657→
+   658→interface InputReq {
+   659→  /** Canonical key under which the resolved path is stored. */
+   660→  key: string;
+   661→  /** Upstream output keys that satisfy this requirement (first match wins). */
+   662→  accepts: string[];
+   663→  /** Upstream job types allowed to provide it. */
+   664→  from: string[];
+   665→  /** Human label used in honest-failure messages. */
+   666→  label: string;
+   667→  /** Drop this requirement entirely when the predicate fires — e.g.
+   668→   *  autopick's 2D references are NOT needed in Laplacian-of-Gaussian
+   669→   *  (reference-free) mode, so the job can run straight after CTF. */
+   670→  skipIf?: (params: Record<string, unknown>) => boolean;
+   671→  /** Best-effort requirement: a missing optional input never blocks the
+   672→   *  run — it is simply absent from the resolved inputs (display-only
+   673→   *  sources like select2d's class-averages gallery). */
+   674→  optional?: boolean;
+   675→}
+   676→
+   677→const INPUTS: Record<string, InputReq[]> = {
+   678→  ctffind: [
+   679→    { key: "micrographs_star", accepts: ["micrographs_star"], from: ["import", "motioncorr"], label: "micrographs.star (run Import first)" },
+   680→  ],
+   681→  motioncorr: [
+   682→    { key: "micrographs_star", accepts: ["micrographs_star"], from: ["import"], label: "micrographs.star (run Import first)" },
+   683→  ],
+   684→  manualpick: [
+   685→    { key: "micrographs_star", accepts: ["micrographs_star"], from: ["import", "motioncorr", "ctffind"], label: "micrographs.star (run Import first)" },
+   686→  ],
+   687→  autopick: [
+   688→    { key: "micrographs_star", accepts: ["micrographs_star", "micrographs_ctf_star"], from: ["import", "motioncorr", "ctffind"], label: "micrographs.star (run Import first)" },
+   689→    {
+   690→      key: "refs_mrc",
+   691→      accepts: ["classes_mrc", "model_mrc"],
+   692→      from: ["class2d", "initialmodel", "class3d"],
+   693→      label: "2D reference templates (run Class2D first) — or switch Picking method to Laplacian of Gaussian (reference-free)",
+   694→      // LoG picking needs no templates — the refs input is only a hard
+   695→      // requirement in "References" mode (param default = LoG).
+   696→      skipIf: (p) => String(p.pickingMethod ?? "Laplacian of Gaussian") !== "References",
+   697→    },
+   698→  ],
+   699→  extract: [
+   700→    { key: "micrographs_star", accepts: ["micrographs_star", "micrographs_ctf_star"], from: ["import", "motioncorr", "ctffind"], label: "micrographs.star (run Import first)" },
+   701→    { key: "coords_dir", accepts: ["coords_dir", "coords_star"], from: ["manualpick", "autopick"], label: "particle coordinates (run ManualPick/AutoPick first)" },
+   702→  ],
+   703→  select: [
+   704→    { key: "particles_star", accepts: ["particles_star"], from: ["extract", "class2d", "select", "select2d", "joinstar", "symexpand", "rebalance"], label: "particles.star (run Extract first)" },
+   705→  ],
+   706→  select2d: [
+   707→    { key: "particles_star", accepts: ["particles_star"], from: ["class2d", "select2d"], label: "classified particles STAR with _rlnClassNumber (run 2D Classification first)" },
+   708→    // class averages only feed the selection GALLERY — missing stack must
+   709→    // never block the run (older jobs may lack the output)
+   710→    { key: "classes_mrc", accepts: ["classes_mrc"], from: ["class2d"], label: "2D class averages (gallery)", optional: true },
+   711→  ],
+   712→  class2d: [
+   713→    { key: "particles_star", accepts: ["particles_star"], from: ["extract", "select", "select2d", "class2d", "joinstar", "symexpand", "rebalance"], label: "particles.star (run Extract first)" },
+   714→  ],
+   715→  initialmodel: [
+   716→    { key: "particles_star", accepts: ["particles_star"], from: ["extract", "select", "select2d", "class2d", "joinstar", "symexpand", "rebalance"], label: "particles.star (run Extract first)" },
+   717→  ],
+   718→  class3d: [
+   719→    { key: "particles_star", accepts: ["particles_star"], from: ["extract", "select", "select2d", "class2d", "initialmodel", "symexpand", "rebalance"], label: "particles.star (run Extract first)" },
+   720→    // the reference MUST be a 3D map: initialmodel's VDAM model or class3d's
+   721→    // own 3D class volumes. class2d is deliberately absent — its classes are
+   722→    // 2D averages, and seeding a 3D refinement with them silently produced
+   723→    // garbage (observed live: refine3d exec'd with class2d's
+   724→    // run_unmasked_classes.mrcs as --ref while initialmodel was still running).
+   725→    { key: "model_mrc", accepts: ["model_mrc", "classes_mrc"], from: ["initialmodel", "class3d"], label: "reference map (run InitialModel first)" },
+   726→  ],
+   727→  refine3d: [
+   728→    { key: "particles_star", accepts: ["particles_star"], from: ["extract", "select", "select2d", "class2d", "joinstar", "initialmodel", "symexpand", "rebalance"], label: "particles.star (run Extract first)" },
+   729→    // 3D reference only — never class2d's 2D averages (see class3d note)
+   730→    { key: "model_mrc", accepts: ["model_mrc", "classes_mrc"], from: ["initialmodel", "class3d"], label: "reference map (run InitialModel first)" },
+   731→  ],
+   732→  multibody: [
+   733→    { key: "particles_star", accepts: ["particles_star"], from: ["extract", "select", "select2d", "class2d", "symexpand", "rebalance"], label: "particles.star (run Extract first)" },
+   734→    { key: "optimiser_star", accepts: ["optimiser_star"], from: ["refine3d", "class3d"], label: "optimiser.star (run Refine3D first)" },
+   735→  ],
+   736→  symexpand: [
+   737→    { key: "particles_star", accepts: ["particles_star", "refine_data_star"], from: ["extract", "select", "select2d", "class2d", "initialmodel", "class3d", "refine3d", "joinstar", "symexpand", "rebalance"], label: "particles.star with Euler angles (run Extract/Refine first)" },
+   738→  ],
+   739→  rebalance: [
+   740→    { key: "particles_star", accepts: ["particles_star", "refine_data_star"], from: ["extract", "select", "select2d", "class2d", "initialmodel", "class3d", "refine3d", "joinstar", "symexpand", "rebalance"], label: "oriented particles STAR with _rlnAngleRot/Tilt (refine/classify output)" },
+   741→  ],
+   742→  maskcreate: [
+   743→    { key: "map_mrc", accepts: ["half1_mrc", "model_mrc", "map_mrc"], from: ["refine3d", "initialmodel", "class3d", "postprocess", "localres"], label: "3D map (run Refine3D first)" },
+   744→  ],
+   745→  postprocess: [
+   746→    { key: "half1_mrc", accepts: ["half1_mrc"], from: ["refine3d"], label: "half1 map (run Refine3D first)" },
+   747→    { key: "half2_mrc", accepts: ["half2_mrc"], from: ["refine3d"], label: "half2 map (run Refine3D first)" },
+   748→    { key: "mask_mrc", accepts: ["mask_mrc"], from: ["maskcreate"], label: "solvent mask (run MaskCreate first)" },
+   749→  ],
+   750→  localres: [
+   751→    { key: "half1_mrc", accepts: ["half1_mrc"], from: ["refine3d"], label: "half1 map (run Refine3D first)" },
+   752→    { key: "mask_mrc", accepts: ["mask_mrc"], from: ["maskcreate"], label: "solvent mask (run MaskCreate first)" },
+   753→  ],
+   754→  polish: [
+   755→    { key: "particles_star", accepts: ["particles_star", "refine_data_star"], from: ["extract", "refine3d", "class2d", "symexpand", "rebalance"], label: "particles.star (run Extract first)" },
+   756→    { key: "postprocess_star", accepts: ["postprocess_star"], from: ["postprocess"], label: "postprocess.star (run PostProcess first)" },
+   757→    { key: "micrographs_star", accepts: ["micrographs_star", "corrected_micrographs_star"], from: ["motioncorr", "import"], label: "corrected micrographs.star (run MotionCorr first)" },
+   758→  ],
+   759→  ctfrefine: [
+   760→    { key: "particles_star", accepts: ["particles_star", "refine_data_star"], from: ["extract", "refine3d", "class2d", "symexpand", "rebalance"], label: "particles.star (run Extract first)" },
+   761→    { key: "postprocess_star", accepts: ["postprocess_star"], from: ["postprocess"], label: "postprocess.star (run PostProcess first)" },
+   762→  ],
+   763→  dynamight: [
+   764→    { key: "particles_star", accepts: ["particles_star", "refine_data_star"], from: ["extract", "refine3d", "class2d", "symexpand", "rebalance"], label: "particles.star (run Extract first)" },
+   765→    { key: "model_mrc", accepts: ["model_mrc", "map_mrc"], from: ["refine3d", "postprocess"], label: "consensus map (run Refine3D first)" },
+   766→  ],
+   767→  modelangelo: [
+   768→    { key: "map_mrc", accepts: ["map_mrc", "model_mrc"], from: ["postprocess", "refine3d"], label: "sharpened map (run PostProcess first)" },
+   769→  ],
+   770→  subtract: [
+   771→    { key: "optimiser_star", accepts: ["optimiser_star"], from: ["refine3d", "class3d"], label: "optimiser.star (run Refine3D first)" },
+   772→    { key: "mask_mrc", accepts: ["mask_mrc"], from: ["maskcreate"], label: "mask of signal to subtract (run MaskCreate first)" },
+   773→    { key: "particles_star", accepts: ["particles_star"], from: ["extract", "refine3d"], label: "particles.star (run Extract first)" },
+   774→  ],
+   775→  tomo_import: [],
+   776→  tomo_aligntiltseries: [
+   777→    { key: "tilt_series_star", accepts: ["tilt_series_star", "tilt_series_ctf_star"], from: ["tomo_import", "tomo_exclude"], label: "tilt_series.star (run Tomo: Import first)" },
+   778→  ],
+   779→  tomo_tomograms: [
+   780→    { key: "tilt_series_star", accepts: ["aligned_tilt_series_star", "tilt_series_star"], from: ["tomo_aligntiltseries", "tomo_import"], label: "aligned tilt series (run Tomo: Align Tilt Series first)" },
+   781→  ],
+   782→  tomo_ctfrefine: [
+   783→    { key: "particles_star", accepts: ["particles_star"], from: ["tomo_extract", "tomo_picks"], label: "particles.star (run Tomo: Extract first)" },
+   784→    { key: "half1_mrc", accepts: ["half1_mrc"], from: ["tomo_reconstruct", "refine3d"], label: "reference half-map (run Tomo: Reconstruct first)" },
+   785→  ],
+   786→  tomo_exclude: [
+   787→    { key: "tilt_series_star", accepts: ["tilt_series_star"], from: ["tomo_import", "tomo_aligntiltseries"], label: "tilt_series.star (run Tomo: Import first)" },
+   788→  ],
+   789→  tomo_polish: [
+   790→    { key: "particles_star", accepts: ["particles_star"], from: ["tomo_extract", "tomo_picks"], label: "particles.star (run Tomo: Extract first)" },
+   791→    { key: "half1_mrc", accepts: ["half1_mrc"], from: ["tomo_reconstruct", "refine3d"], label: "reference half-map (run Tomo: Reconstruct first)" },
+   792→  ],
+   793→  tomo_reconstruct: [
+   794→    { key: "particles_star", accepts: ["particles_star"], from: ["tomo_extract", "tomo_picks"], label: "particles.star (run Tomo: Extract first)" },
+   795→  ],
+   796→  tomo_denoise: [
+   797→    { key: "tomograms_star", accepts: ["tomograms_star"], from: ["tomo_tomograms"], label: "tomograms.star (run Tomo: Reconstruct Tomograms first)" },
+   798→  ],
+   799→  tomo_picks: [
+   800→    { key: "tilt_series_star", accepts: ["tilt_series_star", "aligned_tilt_series_star"], from: ["tomo_aligntiltseries", "tomo_import"], label: "tilt_series.star (run Tomo: Import first)" },
+   801→  ],
+   802→  tomo_extract: [
+   803→    { key: "particles_star", accepts: ["particles_star"], from: ["tomo_picks"], label: "picks (run Tomo: Picking first)" },
+   804→  ],
+   805→  external: [],
+   806→};
+   807→
+   808→/** Requirements a type can NEVER resolve through the graph → generic fail. */
+   809→const GENERIC_REQUIREMENTS: Record<string, string> = {
+   810→  multibody: "a body STAR file (bodies.star with multi-body masks)",
+   811→  joinstar: "two or more particle STAR files wired as inputs (joinstar combines them)",
+   812→  tomo_import: "SerialEM tilt-series movies + .mdoc files (no tilt data present in this project)",
+   813→  external: "a custom run.sh script inside the job directory",
+   814→};
+   815→
+   816→/**
+   817→ * Resolve required inputs from upstream completed runs.
+   818→ * `missing` is a human-readable message (null on success); `wait` classifies
+   819→ * WHY an input is missing so the dispatcher can mark the job PENDING
+   820→ * (upstream failed / still running / never ran) instead of failed — a failed
+   821→ * upstream used to cascade red "Waiting for upstream output" failures down
+   822→ * the entire pipeline.
+   823→ */
+   824→function resolveInputs(
+   825→  type: string,
+   826→  upstream: UpstreamRef[],
+   827→  params?: Record<string, unknown>
+   828→): { inputs: Record<string, string>; missing: string | null; wait?: WaitKind } {
+   829→  // param-driven optionality: drop requirements whose skipIf fires
+   830→  // (only the dispatch call passes params — the manualpick/select
+   831→  // pre-flight lookups have no skipIf requirements).
+   832→  const reqs = (INPUTS[type] ?? []).filter(
+   833→    (r) => !r.skipIf || !params || !r.skipIf(params)
+   834→  );
+   835→  const runs = readRuns();
+   836→  const inputs: Record<string, string> = {};
+   837→
+   838→  for (const req of reqs) {
+   839→    let resolved: string | null = null;
+   840→    // upstream arrives in INPUT-PRIORITY order from lineageFor(): BFS by
+   841→    // graph distance (direct parents first) with newest-first within a
+   842→    // layer — scan forward and take the first provider that has the output.
+   843→    const providers: { name: string; status: string }[] = [];
+   844→    for (const up of upstream) {
+   845→      if (!req.from.includes(up.type)) continue;
+   846→      const state = runs[up.id];
+   847→      if (state && state.done && state.exitCode === 0) {
+   848→        for (const key of req.accepts) {
+   849→          const p = state.outputs[key];
+   850→          if (p && existsSync(p)) {
+   851→            resolved = p;
+   852→            break;
+   853→          }
+   854→        }
+   855→        if (resolved) break;
+   856→      }
+   857→      providers.push({ name: up.name ?? up.type, status: up.status ?? "idle" });
+   858→    }
+   859→    if (!resolved) {
+   860→      // optional inputs degrade silently (gallery sources, previews)
+   861→      if (req.optional) continue;
+   862→      // pick the most actionable blocker: a FAILED provider (re-run it)
+   863→      // beats a RUNNING one (transient wait) beats anything else
+   864→      const failed = providers.find((p) => p.status === "failed");
+   865→      const running = providers.find((p) => p.status === "running");
+   866→      if (failed) {
+   867→        return {
+   868→          inputs: {},
+   869→          missing: `Upstream "${failed.name}" failed — fix and re-run it; this job then starts automatically once its inputs are ready`,
+   870→          wait: "upstream-failed",
+   871→        };
+   872→      }
+   873→      if (running) {
+   874→        return {
+   875→          inputs: {},
+   876→          missing: `Waiting for upstream "${running.name}" to finish… (this job starts automatically when it does)`,
+   877→          wait: "upstream-running",
+   878→        };
+   879→      }
+   880→      return {
+   881→        inputs: {},
+   882→        missing: `Waiting for upstream output: ${req.label} — runs automatically once ready`,
+   883→        wait: "not-ready",
+   884→      };
+   885→    }
+   886→    inputs[req.key] = resolved;
+   887→  }
+   888→  return { inputs, missing: null };
+   889→}
+   890→
+   891→/* ------------------------------------------------------------------ */
+   892→/* Command templates (all 32 types — for reference/UI)                  */
+   893→/* ------------------------------------------------------------------ */
+   894→
+   895→/**
+   896→ * Canonical RELION 5.0.1 command templates (extracted from pipeline_jobs.cpp).
+   897→ * <...> placeholders are substituted with real paths/params by buildArgv().
+   898→ */
+   899→export const COMMAND_TEMPLATES: Record<string, string> = {
+   900→  import: "engine-native: write micrographs.star (RELION 5 optics format)",
+   901→  motioncorr: "relion_run_motioncorr --i <micrographs.star> --o <outdir>/ --use_motioncor2 --motioncor2_exe <mc2> --bin_factor <bf> --bfactor <bfac> --dose_per_frame <dose> --patch_x <px> --patch_y <py> --j <n>",
+   902→  ctffind: "relion_run_ctffind --i <micrographs.star> --o <outdir>/ --Box <box> --ResMin <rmin> --ResMax <rmax> --dFMin <dmin> --dFMax <dmax> --FStep 500 --dAst 0 --is_ctffind4 --fast_search [--ctffind_exe <ctffind>]",
+   903→  manualpick: "engine-native: import Henderson .coord picks → manualpick.star (_rlnCoordinateX/Y + _rlnMicrographName)",
+   904→  autopick: "relion_autopick --i <micrographs.star> --odir <outdir>/ --pickname autopick [--LoG --LoG_diam_min <Å> --LoG_diam_max <Å> --LoG_adjust_threshold <t> | --ref <refs.mrc> --particle_diameter <dia> --threshold <thr> --lowpass <lp>]",
+   905→  extract: "relion_preprocess --i <micrographs_ctf.star> --coord_list <coords.star> --part_star <outdir>/particles.star --part_dir <outdir>/ --extract --extract_size <box> [--scale <down>] --norm --bg_radius <bgr> --white_dust 3 --black_dust -3",
+   906→  select: "engine-native: particle selection — class-aware occupancy pruning when input has _rlnClassNumber, else first-N",
+   907→  select2d: "engine-native: 2D class selection — keep particles whose _rlnClassNumber is in the selected set (gallery picks or auto occupancy ≥ cutoff × best) → particles_select2d.star",
+   908→  class2d: "relion_refine --i <particles.star> --o <outdir>/run --K <K> --tau2_fudge 1 --particle_diameter <dia> --ctf --pad 2 --iter <it> --flatten_solvent --zero_mask --j 4",
+   909→  initialmodel: "relion_refine --grad --denovo_3dref --i <particles.star> --o <outdir>/run --K <K> --particle_diameter <dia> --sym <sym> --ctf --iter <it> --flatten_solvent --zero_mask",
+   910→  class3d: "mpirun -n 2 relion_refine --i <particles.star> --ref <ref.mrc> --o <outdir>/run --K <K> --tau2_fudge 4 --particle_diameter <dia> --sym <sym> --ctf --pad 2 --iter <it> --flatten_solvent",
+   911→  refine3d: "mpirun -n 3 relion_refine --i <particles.star> --ref <ref.mrc> --o <outdir>/run --sym <sym> --particle_diameter <dia> --ctf --pad <pad> --firstiter_cc --ini_high <iniHigh> --trust_ref_size --split_random_halves [--auto_refine | --iter <it> --tau2_fudge 1]",
+   912→  multibody: "mpirun -n 2 relion_refine --continue <optimiser.star> --o <outdir>/run --solvent_correct_fsc --multibody_masks <bodies.star> --oversampling 1",
+   913→  symexpand: "engine-native: point-group expansion — every particle row replicated |G|× with composed ZYZ Euler angles → particles_symexpand.star (icosahedral-symmetry-expander algorithm)",
+   914→  rebalance: "engine-native: orientation balancing — fib-sphere binning + 3DFSC estimates + per-bin percentile trimming (Orient-Rebalancer core) → particles_rebalance.star + rebalance_report.json",
+   915→  maskcreate: "relion_mask_create --i <half1.mrc> --o <outdir>/mask.mrc --lowpass <lp> --angpix <pix> --ini_threshold <thr> --extend_inimask <ext> --width_soft_edge <soft> --j 4",
+   916→  joinstar: "relion_star_handler --combine --i <parts1.star parts2.star ...> --check_duplicates rlnImageName --o <outdir>/join_particles.star",
+   917→  subtract: "relion_particle_subtract --i <optimiser.star> --mask <mask.mrc> --data <particles.star> --o <outdir>/ [--recenter_on_mask] [--float16] [--new_box <box>]",
+   918→  postprocess: "relion_postprocess --i <half1.mrc> --o <outdir>/postprocess --mask <mask.mrc> --angpix <pix> [--auto_bfac --autob_lowres <lr>]",
+   919→  localres: "relion_postprocess --locres --i <half1.mrc> --o <outdir>/relion --angpix <pix> --adhoc_bfac <bfac> [--mask <mask.mrc>]",
+   920→  polish: "relion_motion_refine --i <particles.star> --f <postprocess.star> --corr_mic <corrected_micrographs.star> --first_frame <f> --last_frame <l> --o <outdir>/ --eval_frac <ef>",
+   921→  ctfrefine: "relion_ctf_refine --i <particles.star> --f <postprocess.star> --o <outdir>/ --fit_defocus --kmin_defocus <kmin>",
+   922→  dynamight: "relion_python_dynamight optimize-deformations --refinement-star-file <particles.star> --output-directory <outdir>/ --initial-model <map.mrc> --n-gaussians <ng> --regularization-factor <rf> --n-threads <nt>",
+   923→  modelangelo: "model_angelo build_no_seq -v <map.mrc> -o <outdir>/ -d <gpu>",
+   924→  tomo_import: "relion_python_tomo_import SerialEM --tilt-image-movie-pattern <movies> --mdoc-file-pattern <mdocs> --nominal-tilt-axis-angle <angle> --nominal-pixel-size <pix> --voltage <kV> --spherical-aberration <Cs> --amplitude-contrast <Q0> --dose-per-tilt-image <dose> --output-directory <outdir>/",
+   925→  tomo_aligntiltseries: "relion_align_tiltseries --i <tilt_series.star> --o <outdir>/ --tomogram_thickness <thick> --aretomo2 --aretomo_exe <aretomo> --gpu <gpu>",
+   926→  tomo_tomograms: "relion_tomo_reconstruct_tomogram --t <aligned_tilt_series.star> --o <outdir>/ --w <xdim> --h <ydim> --d <zdim> --binned_angpix <binned> --j <n>",
+   927→  tomo_ctfrefine: "relion_tomo_refine_ctf --i <particles.star> --ref1 <half1.mrc> --ref2 <half2.mrc> --b <box> --focus_range <range> --o <outdir>/",
+   928→  tomo_exclude: "relion_python_tomo_exclude_tilt_images --tilt-series-star-file <tilt_series.star> --cache-size <cache> --output-directory <outdir>/",
+   929→  tomo_polish: "relion_tomo_align --ref1 <half1.mrc> --ref2 <half2.mrc> --theme classic --o <outdir>/ --b <box> --r <maxerr> [--shift_only]",
+   930→  tomo_reconstruct: "relion_tomo_reconstruct_particle --i <particles.star> --theme classic --o <outdir>/ --b <box> --bin <bin> --j <n> --sym C1",
+   931→  tomo_denoise: "relion_python_tomo_denoise cryoCARE:<train|predict> --tomogram-star-file <tomograms.star> --output-directory <outdir>/ --gpu <gpu>",
+   932→  tomo_picks: "relion_python_tomo_pick <mode> --tilt-series-star-file <tilt_series.star> --output-directory <outdir>/ && relion_python_tomo_get_particle_poses <mode> --annotations-directory <outdir>/annotations --output-directory <outdir>/",
+   933→  tomo_extract: "relion_tomo_subtomo --i <particles.star> --theme classic --o <outdir>/ --b <box> --bin <bin> --stack2d --float16 --j <n>",
+   934→  external: "bash <outdir>/run.sh (user-provided script, RELION metadata exported as env vars)",
+   935→};
+   936→
+   937→/* ------------------------------------------------------------------ */
+   938→/* STAR file helpers                                                    */
+   939→/* ------------------------------------------------------------------ */
+   940→
+   941→interface StarBlock {
+   942→  /** "data_xxx" header line. */
+   943→  header: string;
+   944→  /** All following lines (including loop_/labels/rows). */
+   945→  lines: string[];
+   946→}
+   947→
+   948→function parseStarBlocks(text: string): StarBlock[] {
+   949→  const blocks: StarBlock[] = [];
+   950→  let current: StarBlock | null = null;
+   951→  for (const raw of text.split(/\r?\n/)) {
+   952→    const line = raw.trimEnd();
+   953→    if (/^data_/.test(line.trim())) {
+   954→      current = { header: line.trim(), lines: [] };
+   955→      blocks.push(current);
+   956→    } else if (current) {
+   957→      current.lines.push(line);
+   958→    }
+   959→  }
+   960→  return blocks;
+   961→}
+   962→
+   963→/** Micrograph names from a micrographs.star (first column after the loop header). */
+   964→function micrographNames(starPath: string): string[] {
+   965→  const blocks = parseStarBlocks(readFileSync(starPath, "utf8"));
+   966→  const micBlock = blocks.find(
+   967→    (b) => b.header === "data_micrographs" || b.lines.some((l) => l.includes("_rlnMicrographName"))
+   968→  );
+   969→  if (!micBlock) return [];
+   970→  const names: string[] = [];
+   971→  for (const line of micBlock.lines) {
+   972→    const t = line.trim();
+   973→    if (!t || t.startsWith("#") || t === "loop_" || t.startsWith("_rln") || t.startsWith("data_")) {
+   974→      continue;
+   975→    }
+   976→    const first = t.split(/\s+/)[0];
+   977→    if (first) names.push(first);
+   978→  }
+   979→  return names;
+   980→}
+   981→
+   982→/* ------------------------------------------------------------------ */
+   983→/* Engine-native jobs                                                   */
+   984→/* ------------------------------------------------------------------ */
+   985→
+   986→interface NativeResult {
+   987→  ok: boolean;
+   988→  result?: string;
+   989→  error?: string;
+   990→  /** Set when the failure is an upstream-waiting condition → job goes PENDING. */
+   991→  wait?: WaitKind;
+   992→}
+   993→
+   994→function recordNativeRun(
+   995→  job: EngineJobRef,
+   996→  workdir: string,
+   997→  cmd: string,
+   998→  outputs: Record<string, string>,
+   999→  result: string,
+  1000→  logText: string
+  1001→): void {
+  1002→  const logFile = path.join(workdir, "run.out");
+  1003→  const errFile = path.join(workdir, "run.err");
+  1004→  appendFileSync(logFile, logText);
+  1005→  writeFileSync(errFile, "");
+  1006→  const runs = readRuns();
+  1007→  runs[job.id] = {
+  1008→    jobId: job.id,
+  1009→    projectId: job.projectId,
+  1010→    type: job.type,
+  1011→    pid: null,
+  1012→    cmd,
+  1013→    workdir,
+  1014→    logFile,
+  1015→    errFile,
+  1016→    startedAt: new Date().toISOString(),
+  1017→    outputs,
+  1018→    done: true,
+  1019→    exitCode: 0,
+  1020→    result,
+  1021→  };
+  1022→  writeRuns(runs);
+  1023→}
+  1024→
+  1025→/** Import: writes a RELION 5 optics-group micrographs.star (EMPIAR or empty). */
+  1026→async function runImportNative(job: EngineJobRef): Promise<NativeResult> {
+  1027→  const workdir = workdirFor(job);
+  1028→  mkdirSync(workdir, { recursive: true });
+  1029→  const projectDir = projectDirFor(job);
+  1030→  mkdirSync(projectDir, { recursive: true });
+  1031→
+  1032→  const pixel = num(job, "pixelSize", 1.77);
+  1033→  const kV = num(job, "voltage", 300);
+  1034→  const cs = num(job, "cs", 2.7);
+  1035→  const q0 = num(job, "ampContrast", 0.1);
+  1036→  const empiar =
+  1037→    String(job.params.empiarData ?? "") === "true" &&
+  1038→    !String(job.params.micrographsPath ?? "").trim();
+  1039→
+  1040→  const starPath = path.join(workdir, "micrographs.star");
+  1041→  const lines: string[] = [
+  1042→    "data_optics",
+  1043→    "",
+  1044→    "loop_",
+  1045→    "_rlnOpticsGroup #1",
+  1046→    "_rlnOpticsGroupName #2",
+  1047→    "_rlnMicrographPixelSize #3",
+  1048→    "_rlnVoltage #4",
+  1049→    "_rlnSphericalAberration #5",
+  1050→    "_rlnAmplitudeContrast #6",
+  1051→    `1 optGroup1 ${pixel} ${kV} ${cs} ${q0}`,
+  1052→    "",
+  1053→    "data_micrographs",
+  1054→    "",
+  1055→    "loop_",
+  1056→    "_rlnMicrographName #1",
+  1057→    "_rlnOpticsGroup #2",
+  1058→  ];
+  1059→
+  1060→  let result: string;
+  1061→  let sourceLabel = "";
+  1062→  if (empiar) {
+  1063→    const mrcs = existsSync(EMPIAR_DIR)
+  1064→      ? readdirSync(EMPIAR_DIR)
+  1065→          .filter((f) => f.endsWith(".mrc"))
+  1066→          .sort()
+  1067→      : [];
+  1068→    if (mrcs.length === 0) {
+  1069→      return { ok: false, error: `EMPIAR directory not found: ${EMPIAR_DIR}` };
+  1070→    }
+  1071→    // Project-relative paths + a symlink so every downstream RELION job (run
+  1072→    // with CWD = projectDir) can open "micrographs/<name>.mrc". This mirrors
+  1073→    // the RELION pipeliner: STAR paths are project-root-relative.
+  1074→    const micLink = path.join(projectDir, "micrographs");
+  1075→    if (!existsSync(micLink)) symlinkSync(EMPIAR_DIR, micLink);
+  1076→    // Also expose the micrographs inside the import job's own workdir so the
+  1077→    // Files tab + gallery can serve PNG previews through outputs/file.
+  1078→    const micLinkInWorkdir = path.join(workdir, "micrographs");
+  1079→    if (!existsSync(micLinkInWorkdir)) symlinkSync(EMPIAR_DIR, micLinkInWorkdir);
+  1080→    for (const m of mrcs) lines.push(`micrographs/${m} 1`);
+  1081→    result = `${mrcs.length} micrographs imported · EMPIAR-10017 (pixel ${pixel} Å)`;
+  1082→    sourceLabel = `source: EMPIAR-10017 ${EMPIAR_DIR}`;
+  1083→  } else {
+  1084→    // ---- user-selected source — RELION "Select files by" forms ----------
+  1085→    // micrographsPath accepts THREE shapes (exactly one param):
+  1086→    //   1. a folder            → import every image inside it
+  1087→    //   2. a wildcard pattern  → /data/movies/*.tiff — expanded here
+  1088→    //   3. file paths          → newline-separated multi-select list
+  1089→    const customRaw = String(job.params.micrographsPath ?? "").trim();
+  1090→    if (customRaw) {
+  1091→      const status = await detectRelion();
+  1092→      const bridge = bridgeFromStatus(status);
+  1093→      const toHost = (p: string) => userPathToHost(p, bridge?.distro ?? null);
+  1094→
+  1095→      const listed = customRaw.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  1096→      const multiFile = listed.length > 1;
+  1097→      const single = listed[0] ?? "";
+  1098→      const isPattern = !multiFile && hasWildcard(single);
+  1099→
+  1100→      let hostFiles: string[] = [];
+  1101→      let skipped = 0; // non-image files filtered out of an explicit set
+  1102→
+  1103→      if (multiFile) {
+  1104→        // ---- 3. explicit multi-select file list ---------------------------
+  1105→        for (const line of listed) {
+  1106→          const host = toHost(line);
+  1107→          try {
+  1108→            if (!statSync(host).isFile()) {
+  1109→              return {
+  1110→                ok: false,
+  1111→                error: `Not a file: ${line} — re-pick the micrographs in the params tab (Browse → Files)`,
+  1112→              };
+  1113→            }
+  1114→          } catch {
+  1115→            return {
+  1116→              ok: false,
+  1117→              error: `File not accessible: ${line} — re-pick the micrographs in the params tab (Browse → Files)`,
+  1118→            };
+  1119→          }
+  1120→          if (MIC_RE.test(path.basename(host))) hostFiles.push(host);
+  1121→          else skipped += 1;
+  1122→        }
+  1123→      } else if (isPattern) {
+  1124→        // ---- 2. wildcard pattern (RELION "File name pattern") -------------
+  1125→        const expanded = expandPattern(single, toHost);
+  1126→        if ("error" in expanded) {
+  1127→          return { ok: false, error: `${expanded.error} — check the pattern in the params tab` };
+  1128→        }
+  1129→        for (const f of expanded.files) {
+  1130→          if (MIC_RE.test(path.basename(f))) hostFiles.push(f);
+  1131→          else skipped += 1;
+  1132→        }
+  1133→        if (expanded.total > expanded.files.length) {
+  1134→          sourceLabel = `source: pattern ${single} (${expanded.total} matches, first ${expanded.files.length} imported)`;
+  1135→        }
+  1136→      } else {
+  1137→        // ---- 1. folder (or a single pasted file) --------------------------
+  1138→        const hostDir = toHost(single);
+  1139→        let st: { isDirectory: boolean; isFile: boolean } | null = null;
+  1140→        try {
+  1141→          const s = statSync(hostDir);
+  1142→          st = { isDirectory: s.isDirectory(), isFile: s.isFile() };
+  1143→        } catch {
+  1144→          st = null;
+  1145→        }
+  1146→        if (!st) {
+  1147→          return {
+  1148→            ok: false,
+  1149→            error: `Micrographs folder not accessible: ${customRaw} — re-pick it in the params tab (Browse…)`,
+  1150→          };
+  1151→        }
+  1152→        if (st.isDirectory) {
+  1153→          const mrcs = readdirSync(hostDir)
+  1154→            .filter((f) => MIC_RE.test(f))
+  1155→            .sort();
+  1156→          if (mrcs.length === 0) {
+  1157→            return {
+  1158→              ok: false,
+  1159→              error: `No .mrc/.mrcs/.tif/.eer micrographs found in ${customRaw}`,
+  1160→            };
+  1161→          }
+  1162→          hostFiles = mrcs.map((m) => path.join(hostDir, m));
+  1163→        } else {
+  1164→          if (!MIC_RE.test(path.basename(hostDir))) {
+  1165→            return {
+  1166→              ok: false,
+  1167→              error: `Not a micrograph file (.mrc/.mrcs/.tif/.tiff/.eer): ${customRaw}`,
+  1168→            };
+  1169→          }
+  1170→          hostFiles = [hostDir];
+  1171→        }
+  1172→      }
+  1173→
+  1174→      if (hostFiles.length === 0) {
+  1175→        return {
+  1176→          ok: false,
+  1177→          error: multiFile
+  1178→            ? `No image files (.mrc/.mrcs/.tif/.tiff/.eer) among the ${listed.length} selected paths`
+  1179→            : `No image files (.mrc/.mrcs/.tif/.tiff/.eer) match the pattern ${single}`,
+  1180→        };
+  1181→      }
+  1182→
+  1183→      let unlinked = 0;
+  1184→      if (!multiFile && !isPattern) {
+  1185→        // folder import — link the WHOLE directory (one junction/symlink,
+  1186→        // star stays project-relative; transparent to WSL drvfs too)
+  1187→        const hostDir = toHost(single);
+  1188→        const linked =
+  1189→          linkDirInto(hostDir, path.join(projectDir, "micrographs")) &&
+  1190→          linkDirInto(hostDir, path.join(workdir, "micrographs"));
+  1191→        if (linked) {
+  1192→          for (const f of hostFiles) lines.push(`micrographs/${path.basename(f)} 1`);
+  1193→        } else {
+  1194→          // no link possible (e.g. junction to a UNC \\wsl.localhost target) —
+  1195→          // absolute paths: RELION opens them as-is; on a Windows host with the
+  1196→          // bridge they are translated to WSL-side /… paths.
+  1197→          for (const f of hostFiles) {
+  1198→            lines.push(`${bridge ? hostToWsl(f) : f} 1`);
+  1199→            unlinked += 1;
+  1200→          }
+  1201→        }
+  1202→      } else {
+  1203→        // pattern / file-list — link the FILES into a real project dir
+  1204→        const r = importFileSet(hostFiles, projectDir, workdir, bridge);
+  1205→        for (const e of r.entries) lines.push(`${e} 1`);
+  1206→        unlinked = r.unlinked;
+  1207→      }
+  1208→
+  1209→      const skipNote = skipped > 0 ? ` · ${skipped} non-image file${skipped === 1 ? "" : "s"} skipped` : "";
+  1210→      const linkedCount = hostFiles.length - unlinked;
+  1211→      const linkNote =
+  1212→        unlinked > 0
+  1213→          ? ` · ${linkedCount} linked, ${unlinked} referenced by path (source not linkable)`
+  1214→          : "";
+  1215→      const kindNote = isPattern ? " · pattern" : multiFile ? " · file list" : "";
+  1216→      result = `${hostFiles.length} micrographs imported${kindNote}${skipNote}${linkNote} (pixel ${pixel} Å)`;
+  1217→      if (!sourceLabel) {
+  1218→        sourceLabel =
+  1219→          "source: " +
+  1220→          (isPattern ? "pattern " : multiFile ? `${listed.length} selected files — ` : "") +
+  1221→          customRaw.slice(0, 200) +
+  1222→          (unlinked > 0 ? " (absolute paths)" : "");
+  1223→      }
+  1224→    } else {
+  1225→      result = "Import job completed (no source data configured — pick a micrographs folder, pattern or files in the params tab)";
+  1226→      sourceLabel = "source: (none configured)";
+  1227→    }
+  1228→  }
+  1229→
+  1230→  writeFileSync(starPath, lines.join("\n") + "\n");
+  1231→  const logText = [
+  1232→    `CryoFlow engine-native import ${new Date().toISOString()}`,
+  1233→    `pixel=${pixel} Å  voltage=${kV} kV  Cs=${cs} mm  Q0=${q0}`,
+  1234→    sourceLabel,
+  1235→    `output: ${starPath}`,
+  1236→    result,
+  1237→    "",
+  1238→  ].join("\n");
+  1239→  recordNativeRun(
+  1240→    job,
+  1241→    workdir,
+  1242→    "engine-native: write micrographs.star (RELION 5 optics format)",
+  1243→    { micrographs_star: starPath },
+  1244→    result,
+  1245→    logText
+  1246→  );
+  1247→  return { ok: true, result };
+  1248→}
+  1249→
+  1250→/** ManualPick: import Henderson .coord files as a RELION pick STAR. */
+  1251→async function runManualPickNative(job: EngineJobRef, upstream: UpstreamRef[]): Promise<NativeResult> {
+  1252→  const resolved = resolveInputs("manualpick", upstream);
+  1253→  if (resolved.missing) return { ok: false, error: resolved.missing, wait: resolved.wait };
+  1254→  const micStar = resolved.inputs.micrographs_star;
+  1255→
+  1256→  const workdir = workdirFor(job);
+  1257→  mkdirSync(workdir, { recursive: true });
+  1258→  const starPath = path.join(workdir, "manualpick.star");
+  1259→
+  1260→  const mics = micrographNames(micStar);
+  1261→  if (mics.length === 0) {
+  1262→    return { ok: false, error: `No micrographs found in ${micStar} (run Import first)` };
+  1263→  }
+  1264→  const projectDir = projectDirFor(job);
+  1265→  // Star paths are project-root-relative — resolve to absolute for FS access.
+  1266→  // Absolute entries (import's no-link fallback) may be WSL-side paths on a
+  1267→  // Windows host → translate /mnt/<drive> and distro paths back to host form.
+  1268→  const bridge = bridgeFromStatus(await detectRelion());
+  1269→  const toAbs = (mic: string) => {
+  1270→    const abs = mic.startsWith("/") ? mic : path.join(projectDir, mic);
+  1271→    if (!isWindowsPath(abs) && abs.startsWith("/") && !existsSync(abs)) {
+  1272→      // WSL-side path this host cannot open as-is
+  1273→      const mnt = abs.match(/^\/mnt\/([A-Za-z])\/(.*)$/);
+  1274→      if (mnt) return `${mnt[1].toUpperCase()}:\\${mnt[2].replace(/\//g, "\\")}`;
+  1275→      if (bridge?.distro) {
+  1276→        return `\\\\wsl.localhost\\${bridge.distro}\\${abs.slice(1).replace(/\//g, "\\")}`;
+  1277→      }
+  1278→    }
+  1279→    return abs;
+  1280→  };
+  1281→
+  1282→  const lines: string[] = [
+  1283→    "data_particles",
+  1284→    "",
+  1285→    "loop_",
+  1286→    "_rlnCoordinateX #1",
+  1287→    "_rlnCoordinateY #2",
+  1288→    "_rlnMicrographName #3",
+  1289→  ];
+  1290→  let total = 0;
+  1291→  const missing: string[] = [];
+  1292→  // Also write plain .coord files (RELION extract consumes them via
+  1293→  // --coord_dir/--coord_suffix) — readCoordinates() parses "x y" ASCII.
+  1294→  const coordsDir = path.join(workdir, "micrographs");
+  1295→  mkdirSync(coordsDir, { recursive: true });
+  1296→  const coordText: string[] = [];
+  1297→  for (const mic of mics) {
+  1298→    const micAbs = toAbs(mic);
+  1299→    const coord = micAbs.replace(/\.mrcs?$/i, "") + ".coord";
+  1300→    if (!existsSync(coord)) {
+  1301→      missing.push(path.basename(coord));
+  1302→      continue;
+  1303→    }
+  1304→    const rows = readFileSync(coord, "utf8")
+  1305→      .split(/\r?\n/)
+  1306→      .map((l) => l.trim())
+  1307→      .filter((l) => l.length > 0 && !l.startsWith("#"));
+  1308→    const outRows: string[] = [];
+  1309→    for (const row of rows) {
+  1310→      const parts = row.split(/\s+/);
+  1311→      if (parts.length >= 2) {
+  1312→        // keep the project-relative micrograph name (matches import star)
+  1313→        lines.push(`${parts[0]} ${parts[1]} ${mic}`);
+  1314→        outRows.push(`${parts[0]} ${parts[1]}`);
+  1315→        total++;
+  1316→      }
+  1317→    }
+  1318→    if (outRows.length > 0) {
+  1319→      const base = path.basename(mic).replace(/\.mrcs?$/i, "");
+  1320→      writeFileSync(path.join(coordsDir, base + ".coord"), outRows.join("\n") + "\n");
+  1321→      coordText.push(`  ${base}.coord (${outRows.length} picks)`);
+  1322→    }
+  1323→    // expose the picked micrograph frames next to their coord files so the
+  1324→    // picks preview panel can render overlay thumbnails via outputs/file
+  1325→    const micLink = path.join(coordsDir, path.basename(mic));
+  1326→    if (!existsSync(micLink)) {
+  1327→      try {
+  1328→        symlinkSync(micAbs, micLink);
+  1329→      } catch {
+  1330→        /* best-effort — preview only */
+  1331→      }
+  1332→    }
+  1333→  }
+  1334→  if (total === 0) {
+  1335→    return {
+  1336→      ok: false,
+  1337→      error: `No .coord pick files found beside the micrographs (expected Henderson picks in ${EMPIAR_DIR}) — missing: ${missing.join(", ")}`,
+  1338→    };
+  1339→  }
+  1340→
+  1341→  writeFileSync(starPath, lines.join("\n") + "\n");
+  1342→  const result = `${total} picks imported from Henderson .coord files`;
+  1343→  const logText = [
+  1344→    `CryoFlow engine-native manualpick ${new Date().toISOString()}`,
+  1345→    `micrographs: ${mics.length} (from ${micStar})`,
+  1346→    ...coordText,
+  1347→    `output: ${starPath} (${total} coordinates)`,
+  1348→    `coord files: ${coordsDir}/*.coord (consumed by relion_preprocess --coord_dir)`,
+  1349→    result,
+  1350→    "",
+  1351→  ].join("\n");
+  1352→  recordNativeRun(
+  1353→    job,
+  1354→    workdir,
+  1355→    "engine-native: import Henderson .coord picks",
+  1356→    { coords_star: starPath, coords_dir: workdir },
+  1357→    result,
+  1358→    logText
+  1359→  );
+  1360→  return { ok: true, result };
+  1361→}
+  1362→
+  1363→/** Select: class-aware or first-N subset of upstream particles.star (engine-native).
+  1364→ *
+  1365→ * When the input STAR carries `_rlnClassNumber` (e.g. the run_data.star of a
+  1366→ * Class2D/Class3D job) and classCutoff > 0, classes whose occupancy is below
+  1367→ * cutoff × (largest class occupancy) are pruned — the programmatic equivalent
+  1368→ * of RELION's "select good 2D classes by occupancy" workflow.
+  1369→ * Otherwise: first-N subset.
+  1370→ */
+  1371→async function runSelectNative(job: EngineJobRef, upstream: UpstreamRef[]): Promise<NativeResult> {
+  1372→  const resolved = resolveInputs("select", upstream);
+  1373→  if (resolved.missing) return { ok: false, error: resolved.missing, wait: resolved.wait };
+  1374→  const inStar = resolved.inputs.particles_star;
+  1375→
+  1376→  const workdir = workdirFor(job);
+  1377→  mkdirSync(workdir, { recursive: true });
+  1378→  const outStar = path.join(workdir, "particles_select.star");
+  1379→
+  1380→  const text = readFileSync(inStar, "utf8");
+  1381→  const blocks = parseStarBlocks(text);
+  1382→  const outLines: string[] = [];
+  1383→  let total = 0;
+  1384→  let kept = 0;
+  1385→  const maxN = Math.max(1, Math.round(num(job, "maxParticles", 1000)));
+  1386→  const cutoff = Math.max(0, Math.min(1, num(job, "classCutoff", 0.5)));
+  1387→  const classStats: { cls: string; count: number; kept: boolean }[] = [];
+  1388→  let keptClasses = 0;
+  1389→
+  1390→  for (const block of blocks) {
+  1391→    outLines.push(block.header, "");
+  1392→    const lines = block.lines;
+  1393→    // find the loop header boundary
+  1394→    let i = 0;
+  1395→    const isParticles = lines.some((l) => l.trim().startsWith("_rlnImageName"));
+  1396→    if (!isParticles) {
+  1397→      for (const l of lines) outLines.push(l);
+  1398→      outLines.push("");
+  1399→      continue;
+  1400→    }
+  1401→    // header lines until the first data row
+  1402→    while (
+  1403→      i < lines.length &&
+  1404→      (lines[i].trim() === "" ||
+  1405→        lines[i].trim() === "loop_" ||
+  1406→        lines[i].trim().startsWith("_rln") ||
+  1407→        lines[i].trim().startsWith("#"))
+  1408→    ) {
+  1409→      if (lines[i].trim() !== "") outLines.push(lines[i]);
+  1410→      i++;
+  1411→    }
+  1412→
+  1413→    // class-aware mode: find the _rlnClassNumber column index
+  1414→    const classCol = labelColumn(lines, i, "_rlnClassNumber");
+  1415→
+  1416→    let keepClasses: Set<number> | null = null;
+  1417→    if (classCol >= 0 && cutoff > 0) {
+  1418→      // first pass: occupancy per class
+  1419→      const counts = new Map<number, number>();
+  1420→      for (let r = i; r < lines.length; r++) {
+  1421→        const t = lines[r].trim();
+  1422→        if (!t) continue;
+  1423→        const cells = t.split(/\s+/);
+  1424→        const cls = parseInt(cells[classCol] ?? "", 10);
+  1425→        if (Number.isFinite(cls)) counts.set(cls, (counts.get(cls) ?? 0) + 1);
+  1426→      }
+  1427→      const maxCount = Math.max(0, ...counts.values());
+  1428→      keepClasses = new Set<number>();
+  1429→      for (const [cls, count] of [...counts.entries()].sort((a, b) => b[1] - a[1])) {
+  1430→        const ok = count >= cutoff * maxCount;
+  1431→        classStats.push({ cls: String(cls), count, kept: ok });
+  1432→        if (ok) {
+  1433→          keepClasses.add(cls);
+  1434→          keptClasses++;
+  1435→        }
+  1436→      }
+  1437→    }
+  1438→
+  1439→    for (let r = i; r < lines.length; r++) {
+  1440→      const t = lines[r].trim();
+  1441→      if (!t) continue;
+  1442→      total++;
+  1443→      let keep = kept < maxN;
+  1444→      if (keep && keepClasses) {
+  1445→        const cells = t.split(/\s+/);
+  1446→        const cls = parseInt(cells[classCol] ?? "", 10);
+  1447→        keep = Number.isFinite(cls) && keepClasses.has(cls);
+  1448→      }
+  1449→      if (keep) {
+  1450→        outLines.push(t);
+  1451→        kept++;
+  1452→      }
+  1453→    }
+  1454→    outLines.push("");
+  1455→  }
+  1456→
+  1457→  writeFileSync(outStar, outLines.join("\n") + "\n");
+  1458→  const result =
+  1459→    classStats.length > 0
+  1460→      ? `${kept} of ${total} particles selected · kept ${keptClasses}/${classStats.length} classes (occupancy ≥ ${cutoff}× best)`
+  1461→      : `${kept} of ${total} particles selected`;
+  1462→  const logText = [
+  1463→    `CryoFlow engine-native select ${new Date().toISOString()}`,
+  1464→    `input:  ${inStar} (${total} particles)`,
+  1465→    ...(classStats.length > 0
+  1466→      ? [
+  1467→          "class occupancy (count · kept):",
+  1468→          ...classStats
+  1469→            .sort((a, b) => b.count - a.count)
+  1470→            .map((c) => `  class ${c.cls}: ${c.count} · ${c.kept ? "kept" : "PRUNED"}`),
+  1471→        ]
+  1472→      : [`mode: first-N (no _rlnClassNumber column or classCutoff=0)`]),
+  1473→    `output: ${outStar} (${kept} particles)`,
+  1474→    result,
+  1475→    "",
+  1476→  ].join("\n");
+  1477→  recordNativeRun(job, workdir, "engine-native: particle selection (class-aware)", { particles_star: outStar }, result, logText);
+  1478→  return { ok: true, result };
+  1479→}
+  1480→
+  1481→/**
+  1482→ * Select2d: RELION "Subset selection" on 2D class averages, programmatic
+  1483→ * edition. The input is a Class2D run's per-iteration data STAR (every row
+  1484→ * carries _rlnClassNumber); the output keeps ONLY the rows whose class is
+  1485→ * selected — "auto" (occupancy ≥ cutoff × best class) or an explicit
+  1486→ * comma list driven by the class gallery in the job panel.
+  1487→ */
+  1488→async function runSelect2dNative(job: EngineJobRef, upstream: UpstreamRef[]): Promise<NativeResult> {
+  1489→  const resolved = resolveInputs("select2d", upstream);
+  1490→  if (resolved.missing) return { ok: false, error: resolved.missing, wait: resolved.wait };
+  1491→  const inStar = resolved.inputs.particles_star;
+  1492→
+  1493→  const workdir = workdirFor(job);
+  1494→  mkdirSync(workdir, { recursive: true });
+  1495→  const outStar = path.join(workdir, "particles_select2d.star");
+  1496→
+  1497→  // ---- selection expression -------------------------------------------
+  1498→  const rawSel = String((job.params as Record<string, unknown> | null)?.selectedClasses ?? "auto").trim();
+  1499→  const cutoff = Math.max(0, Math.min(1, num(job, "occupancyCutoff", 0.5)));
+  1500→  const explicit =
+  1501→    rawSel !== "auto" && rawSel !== ""
+  1502→      ? [...new Set(
+  1503→          rawSel
+  1504→            .split(/[,;\s]+/)
+  1505→            .map((s) => parseInt(s, 10))
+  1506→            .filter((n) => Number.isFinite(n) && n > 0)
+  1507→        )]
+  1508→      : [];
+  1509→
+  1510→  const text = readFileSync(inStar, "utf8");
+  1511→  const blocks = parseStarBlocks(text);
+  1512→  const outLines: string[] = [];
+  1513→  let total = 0;
+  1514→  let kept = 0;
+  1515→  const classStats: { cls: number; count: number; kept: boolean }[] = [];
+  1516→  let keep: Set<number> | null = null;
+  1517→  let mode = "";
+  1518→
+  1519→  for (const block of blocks) {
+  1520→    outLines.push(block.header, "");
+  1521→    const lines = block.lines;
+  1522→    const isParticles = lines.some((l) => l.trim().startsWith("_rlnImageName"));
+  1523→    if (!isParticles) {
+  1524→      for (const l of lines) outLines.push(l);
+  1525→      outLines.push("");
+  1526→      continue;
+  1527→    }
+  1528→    let i = 0;
+  1529→    while (
+  1530→      i < lines.length &&
+  1531→      (lines[i].trim() === "" ||
+  1532→        lines[i].trim() === "loop_" ||
+  1533→        lines[i].trim().startsWith("_rln") ||
+  1534→        lines[i].trim().startsWith("#"))
+  1535→    ) {
+  1536→      if (lines[i].trim() !== "") outLines.push(lines[i]);
+  1537→      i++;
+  1538→    }
+  1539→
+  1540→    const classCol = labelColumn(lines, i, "_rlnClassNumber");
+  1541→    if (classCol < 0) {
+  1542→      return {
+  1543→        ok: false,
+  1544→        error: `input STAR has no _rlnClassNumber column (${inStar}) — wire the 2D Classification job's particles output, not a raw Extract star`,
+  1545→      };
+  1546→    }
+  1547→
+  1548→    // occupancy per class
+  1549→    const counts = new Map<number, number>();
+  1550→    for (let r = i; r < lines.length; r++) {
+  1551→      const t = lines[r].trim();
+  1552→      if (!t) continue;
+  1553→      total++;
+  1554→      const cls = parseInt(t.split(/\s+/)[classCol] ?? "", 10);
+  1555→      if (Number.isFinite(cls) && cls > 0) counts.set(cls, (counts.get(cls) ?? 0) + 1);
+  1556→    }
+  1557→
+  1558→    // resolve the keep set once per run (single particles block in practice)
+  1559→    if (!keep) {
+  1560→      const available = [...counts.keys()].sort((a, b) => a - b);
+  1561→      if (explicit.length > 0) {
+  1562→        keep = new Set(explicit.filter((c) => counts.has(c)));
+  1563→        const missing = explicit.filter((c) => !counts.has(c));
+  1564→        if (keep.size === 0) {
+  1565→          return {
+  1566→            ok: false,
+  1567→            error: `selectedClasses lists ${explicit.join(", ")} but the classification only has classes ${available.join(", ")} — pick classes in the gallery first`,
+  1568→          };
+  1569→        }
+  1570→        mode = `manual ${keep.size} class${keep.size > 1 ? "es" : ""}${missing.length > 0 ? ` (ignored: ${missing.join(", ")})` : ""}`;
+  1571→      } else {
+  1572→        const maxCount = Math.max(0, ...counts.values());
+  1573→        keep = new Set([...counts.entries()].filter(([, n]) => n >= cutoff * maxCount).map(([c]) => c));
+  1574→        mode = `auto — occupancy ≥ ${cutoff}× best`;
+  1575→      }
+  1576→      for (const c of available) {
+  1577→        classStats.push({ cls: c, count: counts.get(c) ?? 0, kept: keep.has(c) });
+  1578→      }
+  1579→    }
+  1580→
+  1581→    for (let r = i; r < lines.length; r++) {
+  1582→      const t = lines[r].trim();
+  1583→      if (!t) continue;
+  1584→      const cls = parseInt(t.split(/\s+/)[classCol] ?? "", 10);
+  1585→      if (keep.has(cls)) {
+  1586→        outLines.push(t);
+  1587→        kept++;
+  1588→      }
+  1589→    }
+  1590→    outLines.push("");
+  1591→  }
+  1592→
+  1593→  if (total === 0) {
+  1594→    return { ok: false, error: `no particle rows found in ${inStar}` };
+  1595→  }
+  1596→
+  1597→  writeFileSync(outStar, outLines.join("\n") + "\n");
+  1598→  const keptClasses = classStats.filter((c) => c.kept).length;
+  1599→  const result = `${kept.toLocaleString()} of ${total.toLocaleString()} particles kept · ${keptClasses}/${classStats.length} classes (${mode})`;
+  1600→  const logText = [
+  1601→    `CryoFlow engine-native select2d ${new Date().toISOString()}`,
+  1602→    `input:  ${inStar} (${total} particles)`,
+  1603→    `mode:   ${mode}`,
+  1604→    "class occupancy (count · kept):",
+  1605→    ...classStats
+  1606→      .sort((a, b) => b.count - a.count)
+  1607→      .map((c) => `  class ${c.cls}: ${c.count} · ${c.kept ? "kept" : "PRUNED"}`),
+  1608→    `output: ${outStar} (${kept} particles)`,
+  1609→    result,
+  1610→    "",
+  1611→  ].join("\n");
+  1612→  recordNativeRun(
+  1613→    job,
+  1614→    workdir,
+  1615→    "engine-native: 2D class selection (gallery / occupancy)",
+  1616→    { particles_star: outStar },
+  1617→    result,
+  1618→    logText
+  1619→  );
+  1620→  return { ok: true, result };
+  1621→}
+  1622→
+  1623→/** Symmetry Expansion: replicate every particle row |G|× with composed ZYZ
+  1624→ *  Euler angles (R_final = R_sym · R_orig — the icosahedral-symmetry-expander
+  1625→ *  convention). Engine-native: pure STAR transform, no RELION binary needed. */
+  1626→async function runSymexpandNative(job: EngineJobRef, upstream: UpstreamRef[]): Promise<NativeResult> {
+  1627→  const resolved = resolveInputs("symexpand", upstream);
+  1628→  if (resolved.missing) return { ok: false, error: resolved.missing, wait: resolved.wait };
+  1629→  const inStar = resolved.inputs.particles_star;
+  1630→
+  1631→  const workdir = workdirFor(job);
+  1632→  mkdirSync(workdir, { recursive: true });
+  1633→  const outStar = path.join(workdir, "particles_symexpand.star");
+  1634→
+  1635→  // ---- group generation -----------------------------------------------
+  1636→  const group = str(job, "symmetryGroup", "I").trim().toUpperCase();
+  1637→  const icoSubset = str(job, "icoSubset", "full").trim().toLowerCase();
+  1638→  const doDedupe = flag(job, "deduplicate");
+  1639→  let groupResult: { matrices: Mat3[]; count: number; description: string };
+  1640→  try {
+  1641→    groupResult = generatePointGroup({ group, icoSubset } as PointGroupSpec);
+  1642→  } catch (err) {
+  1643→    return { ok: false, error: err instanceof Error ? err.message : `unknown point group "${group}"` };
+  1644→  }
+  1645→  let matrices = groupResult.matrices;
+  1646→  if (doDedupe) matrices = deduplicateRotations(matrices);
+  1647→  if (matrices.length <= 1) {
+  1648→    return {
+  1649→      ok: false,
+  1650→      error: `group ${group} expands to a single identity rotation — pick a non-trivial group (I, O, T, Cn≥2, Dn)`,
+  1651→    };
+  1652→  }
+  1653→
+  1654→  // ---- STAR transform ---------------------------------------------------
+  1655→  const text = readFileSync(inStar, "utf8");
+  1656→  const blocks = parseStarBlocks(text);
+  1657→  const outLines: string[] = [];
+  1658→  let total = 0;
+  1659→  let expanded = 0;
+  1660→
+  1661→  for (const block of blocks) {
+  1662→    outLines.push(block.header, "");
+  1663→    const lines = block.lines;
+  1664→    const isParticles = lines.some((l) => l.trim().startsWith("_rlnImageName"));
+  1665→    if (!isParticles) {
+  1666→      for (const l of lines) outLines.push(l);
+  1667→      outLines.push("");
+  1668→      continue;
+  1669→    }
+  1670→    let i = 0;
+  1671→    while (
+  1672→      i < lines.length &&
+  1673→      (lines[i].trim() === "" ||
+  1674→        lines[i].trim() === "loop_" ||
+  1675→        lines[i].trim().startsWith("_rln") ||
+  1676→        lines[i].trim().startsWith("#"))
+  1677→    ) {
+  1678→      if (lines[i].trim() !== "") outLines.push(lines[i]);
+  1679→      i++;
+  1680→    }
+  1681→
+  1682→    const rotCol = labelColumn(lines, i, "_rlnAngleRot");
+  1683→    const tiltCol = labelColumn(lines, i, "_rlnAngleTilt");
+  1684→    const psiCol = labelColumn(lines, i, "_rlnAnglePsi");
+  1685→    if (rotCol < 0 || tiltCol < 0) {
+  1686→      return {
+  1687→        ok: false,
+  1688→        error: `input STAR has no _rlnAngleRot/_rlnAngleTilt columns (${inStar}) — symmetry expansion needs ORIENTED particles: wire a 3D classify/refine data star (or a previously expanded stack)`,
+  1689→      };
+  1690→    }
+  1691→
+  1692→    for (let r = i; r < lines.length; r++) {
+  1693→      const t = lines[r].trim();
+  1694→      if (!t) continue;
+  1695→      const parts = t.split(/\s+/);
+  1696→      if (parts.length <= Math.max(rotCol, tiltCol)) continue;
+  1697→      const rot = parseFloat(parts[rotCol]);
+  1698→      const tilt = parseFloat(parts[tiltCol]);
+  1699→      if (!Number.isFinite(rot) || !Number.isFinite(tilt)) continue;
+  1700→      const psi = psiCol >= 0 && psiCol < parts.length ? parseFloat(parts[psiCol]) : 0;
+  1701→      total++;
+  1702→      // |G| copies: the identity element preserves the row, the others rotate
+  1703→      for (const m of matrices) {
+  1704→        const e = applySymmetryToEuler(m, rot, tilt, Number.isFinite(psi) ? psi : 0);
+  1705→        const row = [...parts];
+  1706→        row[rotCol] = e.rot.toFixed(6);
+  1707→        row[tiltCol] = e.tilt.toFixed(6);
+  1708→        if (psiCol >= 0 && psiCol < row.length) row[psiCol] = e.psi.toFixed(6);
+  1709→        outLines.push(row.join(" "));
+  1710→        expanded++;
+  1711→      }
+  1712→    }
+  1713→    outLines.push("");
+  1714→  }
+  1715→
+  1716→  if (total === 0) {
+  1717→    return { ok: false, error: `no particle rows found in ${inStar}` };
+  1718→  }
+  1719→
+  1720→  writeFileSync(outStar, outLines.join("\n") + "\n");
+  1721→  const factor = matrices.length;
+  1722→  const result = `${total.toLocaleString()} × ${factor} = ${expanded.toLocaleString()} particles (${group}${group === "I" ? `/${icoSubset}` : ""})`;
+  1723→  const logText = [
+  1724→    `CryoFlow engine-native symexpand ${new Date().toISOString()}`,
+  1725→    `input:  ${inStar} (${total} particles)`,
+  1726→    `group:  ${groupResult.description}${doDedupe ? " (deduplicated)" : ""}`,
+  1727→    ...describeRotations(matrices).slice(0, 12).map(
+  1728→      (d) =>
+  1729→        `  axis [${d.axis.map((v) => v.toFixed(3)).join(", ")}] ${d.angleDeg.toFixed(1)}° order ${d.order}`
+  1730→    ),
+  1731→    factor > 12 ? `  … ${factor - 12} more rotations` : "",
+  1732→    `output: ${outStar} (${expanded} particles)`,
+  1733→    result,
+  1734→    "",
+  1735→  ]
+  1736→    .filter(Boolean)
+  1737→    .join("\n");
+  1738→  recordNativeRun(
+  1739→    job,
+  1740→    workdir,
+  1741→    "engine-native: point-group symmetry expansion (icosahedral-symmetry-expander)",
+  1742→    { particles_star: outStar },
+  1743→    result,
+  1744→    logText
+  1745→  );
+  1746→  return { ok: true, result };
+  1747→}
+  1748→
+  1749→/** Orientation Rebalancer: fib-sphere binning + per-bin percentile trimming
+  1750→ *  (Orient-Rebalancer core). Writes the kept subset AND a full stats report
+  1751→ *  (rebalance_report.json) consumed by the inspector's report panel. */
+  1752→async function runRebalanceNative(job: EngineJobRef, upstream: UpstreamRef[]): Promise<NativeResult> {
+  1753→  const resolved = resolveInputs("rebalance", upstream);
+  1754→  if (resolved.missing) return { ok: false, error: resolved.missing, wait: resolved.wait };
+  1755→  const inStar = resolved.inputs.particles_star;
+  1756→
+  1757→  const workdir = workdirFor(job);
+  1758→  mkdirSync(workdir, { recursive: true });
+  1759→  const outStar = path.join(workdir, "particles_rebalance.star");
+  1760→  const reportFile = path.join(workdir, "rebalance_report.json");
+  1761→
+  1762→  // ---- params -------------------------------------------------------------
+  1763→  const criterionRaw = str(job, "exclusionCriterion", "loglik").trim().toLowerCase();
+  1764→  const params: RebalanceParams = {
+  1765→    numBins: Math.max(20, Math.round(num(job, "numBins", 200))),
+  1766→    percentile: Math.min(100, Math.max(5, num(job, "percentile", 90))),
+  1767→    exclusionCriterion: (["loglik", "maxprob", "ncc", "random"] as const).includes(
+  1768→      criterionRaw as ExclusionCriterion
+  1769→    )
+  1770→      ? (criterionRaw as ExclusionCriterion)
+  1771→      : "loglik",
+  1772→    mode: str(job, "mode", "standard").trim().toLowerCase() === "resolution" ? "resolution" : "standard",
+  1773→    resolutionWeight: num(job, "resolutionWeight", 1),
+  1774→    seed: Math.max(0, Math.round(num(job, "seed", 1))),
+  1775→  };
+  1776→
+  1777→  // ---- STAR → particles ---------------------------------------------------
+  1778→  const text = readFileSync(inStar, "utf8");
+  1779→  const blocks = parseStarBlocks(text);
+  1780→  const outLines: string[] = [];
+  1781→
+  1782→  // score column per criterion: RELION columns where HIGHER = better particle
+  1783→  // → the core removes the highest score first, so orient as score = -value.
+  1784→  const SCORE_LABELS: Record<ExclusionCriterion, string> = {
+  1785→    loglik: "_rlnLogLikeliContribution",
+  1786→    maxprob: "_rlnMaxValueProbDistribution",
+  1787→    ncc: "_rlnNormCorrection",
+  1788→    random: "",
+  1789→  };
+  1790→
+  1791→  let particles: RebParticle[] = [];
+  1792→  let rows: string[][] = [];
+  1793→  let total = 0;
+  1794→  let scoreFallback = false;
+  1795→
+  1796→  for (const block of blocks) {
+  1797→    outLines.push(block.header, "");
+  1798→    const lines = block.lines;
+  1799→    const isParticles = lines.some((l) => l.trim().startsWith("_rlnImageName"));
+  1800→    if (!isParticles) {
+  1801→      for (const l of lines) outLines.push(l);
+  1802→      outLines.push("");
+  1803→      continue;
+  1804→    }
+  1805→    let i = 0;
+  1806→    while (
+  1807→      i < lines.length &&
+  1808→      (lines[i].trim() === "" ||
+  1809→        lines[i].trim() === "loop_" ||
+  1810→        lines[i].trim().startsWith("_rln") ||
+  1811→        lines[i].trim().startsWith("#"))
+  1812→    ) {
+  1813→      if (lines[i].trim() !== "") outLines.push(lines[i]);
+  1814→      i++;
+  1815→    }
+  1816→
+  1817→    const rotCol = labelColumn(lines, i, "_rlnAngleRot");
+  1818→    const tiltCol = labelColumn(lines, i, "_rlnAngleTilt");
+  1819→    if (rotCol < 0 || tiltCol < 0) {
+  1820→      return {
+  1821→        ok: false,
+  1822→        error: `input STAR has no _rlnAngleRot/_rlnAngleTilt columns (${inStar}) — rebalancing needs ORIENTED particles: wire a 3D classify/refine data star`,
+  1823→      };
+  1824→    }
+  1825→    const scoreLabel = SCORE_LABELS[params.exclusionCriterion];
+  1826→    const scoreCol = scoreLabel ? labelColumn(lines, i, scoreLabel) : -1;
+  1827→    if (params.exclusionCriterion !== "random" && scoreCol < 0) {
+  1828→      scoreFallback = true; // honest degrade: seeded random keeps the run usable
+  1829→    }
+  1830→
+  1831→    particles = [];
+  1832→    rows = [];
+  1833→    total = 0;
+  1834→    for (let r = i; r < lines.length; r++) {
+  1835→      const t = lines[r].trim();
+  1836→      if (!t) continue;
+  1837→      const parts = t.split(/\s+/);
+  1838→      if (parts.length <= Math.max(rotCol, tiltCol)) continue;
+  1839→      const rot = parseFloat(parts[rotCol]);
+  1840→      const tilt = parseFloat(parts[tiltCol]);
+  1841→      if (!Number.isFinite(rot) || !Number.isFinite(tilt)) continue;
+  1842→      let score = 0;
+  1843→      if (scoreCol >= 0 && scoreCol < parts.length) {
+  1844→        const v = parseFloat(parts[scoreCol]);
+  1845→        if (Number.isFinite(v)) score = -v; // oriented: HIGHER = removed first
+  1846→      }
+  1847→      const v = eulerToDirection(rot, tilt);
+  1848→      particles.push({ index: total, rot, tilt, score, vx: v[0], vy: v[1], vz: v[2], binIndex: 0, included: true });
+  1849→      rows.push(parts);
+  1850→      total++;
+  1851→    }
+  1852→    break; // first particles block is the stack (RELION single-block in practice)
+  1853→  }
+  1854→
+  1855→  if (total === 0) {
+  1856→    return { ok: false, error: `no particle rows found in ${inStar}` };
+  1857→  }
+  1858→
+  1859→  // ---- core algorithm --------------------------------------------------------
+  1860→  const report: RebalanceReport = runRebalanceCore(particles, params);
+  1861→  const keptSet = new Set(report.keptIndices);
+  1862→  for (const idx of keptSet) outLines.push(rows[idx].join(" "));
+  1863→  outLines.push("");
+  1864→
+  1865→  writeFileSync(outStar, outLines.join("\n") + "\n");
+  1866→  writeFileSync(reportFile, JSON.stringify(report, null, 2));
+  1867→
+  1868→  const s = report.stats;
+  1869→  const crit = scoreFallback
+  1870→    ? `random (fallback — ${SCORE_LABELS[params.exclusionCriterion]} column absent)`
+  1871→    : report.criterion;
+  1872→  const result =
+  1873→    `${s.totalAfter.toLocaleString()} of ${s.totalBefore.toLocaleString()} particles kept · ` +
+  1874→    `anisotropy ${s.anisotropyBefore.toFixed(2)}→${s.anisotropyAfter.toFixed(2)} · ` +
+  1875→    `uniformity ${s.countUniformityBefore.toFixed(2)}→${s.countUniformityAfter.toFixed(2)}`;
+  1876→  const logText = [
+  1877→    `CryoFlow engine-native rebalance (Orient-Rebalancer core) ${new Date().toISOString()}`,
+  1878→    `input:  ${inStar} (${s.totalBefore} particles)`,
+  1879→    `params: bins=${params.numBins} percentile=${params.percentile}% criterion=${crit} mode=${params.mode}${params.mode === "resolution" ? ` α=${params.resolutionWeight}` : ""} seed=${params.seed}`,
+  1880→    `bins:   ${s.effectiveBins} non-empty · ${s.binsTrimmed} trimmed · removed ${s.removed} (${s.removedPercent.toFixed(1)}%)`,
+  1881→    `3DFSC estimate: mean ${s.meanResolutionBefore.toFixed(2)}→${s.meanResolutionAfter.toFixed(2)} Å · median ${s.medianResolutionBefore.toFixed(2)}→${s.medianResolutionAfter.toFixed(2)} Å · anisotropy ${s.anisotropyBefore.toFixed(2)}→${s.anisotropyAfter.toFixed(2)}`,
+  1882→    `count uniformity: ${s.countUniformityBefore.toFixed(3)}→${s.countUniformityAfter.toFixed(3)} · resolution CV ${s.resolutionCVBefore.toFixed(3)}→${s.resolutionCVAfter.toFixed(3)}`,
+  1883→    `output: ${outStar} (${s.totalAfter} particles)`,
+  1884→    `report: ${reportFile}`,
+  1885→    `note: the 3DFSC here is a distribution-based estimate, not a true two-half-map directional FSC`,
+  1886→    result,
+  1887→    "",
+  1888→  ].join("\n");
+  1889→  recordNativeRun(
+  1890→    job,
+  1891→    workdir,
+  1892→    "engine-native: orientation rebalancing (Orient-Rebalancer core)",
+  1893→    { particles_star: outStar },
+  1894→    result,
+  1895→    logText
+  1896→  );
+  1897→  return { ok: true, result };
+  1898→}
+  1899→
+  1900→/* ------------------------------------------------------------------ */
+  1901→/* CLI argv builders (faithful to pipeline_jobs.cpp)                    */
+  1902→/* ------------------------------------------------------------------ */
+  1903→
+  1904→interface BuildCtx {
+  1905→  binDir: string;
+  1906→  workdir: string;
+  1907→  inputs: Record<string, string>;
+  1908→  job: EngineJobRef;
+  1909→  upstream: UpstreamRef[];
+  1910→  /** Active WSL bridge (null on native execution). */
+  1911→  bridge: WslBridge | null;
+  1912→}
+  1913→
+  1914→function outPath(ctx: BuildCtx, name: string): string {
+  1915→  return path.join(ctx.workdir, name);
+  1916→}
+  1917→
+  1918→// binJoin (imported from ./wsl-bridge) joins binary names onto an install
+  1919→// bin dir WITHOUT path.join — distro-internal POSIX bin dirs get mangled by
+  1920→// path.win32.join on Windows hosts (see wsl-bridge.ts for the full story).
+  1921→
+  1922→/**
+  1923→ * Resolve an external program executable.
+  1924→ *  - native installs: bin dir first, then the host PATH (`which`)
+  1925→ *  - WSL-bridged installs: the bin dir and PATH live INSIDE the distro —
+  1926→ *    host existsSync/`which` cannot see them (and `which` does not exist on
+  1927→ *    Windows at all) — so ask the distro itself with `command -v`.
+  1928→ */
+  1929→async function externalOnPath(
+  1930→  binDir: string,
+  1931→  names: string[],
+  1932→  bridge: WslBridge | null
+  1933→): Promise<string | null> {
+  1934→  for (const n of names) {
+  1935→    if (bridge) {
+  1936→      // distro-side lookup — one wsl.exe call per name
+  1937→      try {
+  1938→        const args: string[] = [];
+  1939→        if (bridge.distro) args.push("-d", bridge.distro);
+  1940→        const q = binDir.replace(/'/g, "'\\''");
+  1941→        const nm = n.replace(/'/g, "'\\''");
+  1942→        args.push(
+  1943→          "-e", "bash", "-lc",
+  1944→          `command -v '${nm}' 2>/dev/null || { test -x '${q}'/'${nm}' && printf '%s' '${q}/${n}'; } || true`
+  1945→        );
+  1946→        const found = await new Promise<string>((resolve) => {
+  1947→          execFile("wsl.exe", args, { timeout: 4000, windowsHide: true }, (err, stdout) => {
+  1948→            const out = String(stdout ?? "").trim();
+  1949→            resolve(!err && out.startsWith("/") ? out : "");
+  1950→          });
+  1951→        });
+  1952→        if (found) return found;
+  1953→      } catch {
+  1954→        /* distro unreachable — the honest not-found error below */
+  1955→      }
+  1956→    } else {
+  1957→      if (existsSync(binJoin(binDir, n))) return binJoin(binDir, n);
+  1958→      const found = await new Promise<string | null>((resolve) => {
+  1959→        execFile("which", [n], { timeout: 2000, windowsHide: true }, (err, stdout) => {
+  1960→          const out = String(stdout ?? "").trim();
+  1961→          resolve(!err && out.includes("/") ? out : null);
+  1962→        });
+  1963→      });
+  1964→      if (found) return found;
+  1965→    }
+  1966→  }
+  1967→  return null;
+  1968→}
+  1969→
+  1970→/**
+  1971→ * Build the real argv for a type. Returns argv (WITHOUT mpirun prefix —
+  1972→ * that is decided by the caller) or an honest-failure message.
+  1973→ */
+  1974→async function buildArgv(ctx: BuildCtx): Promise<string[] | { error: string }> {
+  1975→  const { job, inputs, binDir } = ctx;
+  1976→  const type = job.type;
+  1977→
+  1978→  switch (type) {
+  1979→    case "ctffind": {
+  1980→      const argv = [
+  1981→        binJoin(binDir, "relion_run_ctffind"),
+  1982→        "--i", inputs.micrographs_star,
+  1983→        "--o", ctx.workdir + "/",
+  1984→        "--Box", String(num(job, "box", 512)),
+  1985→        "--ResMin", String(num(job, "resMin", 30)),
+  1986→        "--ResMax", String(num(job, "resMax", 5)),
+  1987→        "--dFMin", String(num(job, "dFMin", 5000)),
+  1988→        "--dFMax", String(num(job, "dFMax", 50000)),
+  1989→        "--FStep", "500",
+  1990→        "--dAst", "0",
+  1991→        "--is_ctffind4",
+  1992→        "--fast_search",
+  1993→      ];
+  1994→      const ctffindExe = resolveCtffind(ctx.bridge);
+  1995→      if (ctffindExe) argv.push("--ctffind_exe", ctffindExe);
+  1996→      return argv;
+  1997→    }
+  1998→
+  1999→    case "extract": {
+  2000→      const box = Math.round(num(job, "boxSize", 128));
+
+[showing lines 1-2000 of 3888; use offset=2001 with limit to continue reading]

@@ -1,0 +1,1321 @@
+     1→/**
+     2→ * CryoFlow — job type catalog (RELION 5: 21 SPA + 10 TOMO + External = 32),
+     3→ * shared by client and server.
+     4→ * Pure data: NO React imports. Lucide icons are referenced by NAME string
+     5→ * and resolved through the client-side iconMap (src/components/workflow/icons.tsx).
+     6→ *
+     7→ * Fidelity sources (RELION 5.0.1 sources in /home/z/relion-build/):
+     8→ *  - pipeline_jobs.cpp  — getCommands*Job builders (command-line authority)
+     9→ *  - gui_jobwindow.cpp  — job-window tabs / labels / defaults (GUI authority)
+    10→ * Tab names below ("Optimisation", "Sampling", "CTFFIND-4.1", "Polish", …)
+    11→ * are lifted verbatim from gui_jobwindow.cpp.
+    12→ */
+    13→
+    14→import type { JobTier, JobTypeSpec, ParamSchema, ParamValue, PortKind, PortSpec } from "./types";
+    15→
+    16→/** Fixed job card geometry (px, in workspace coordinates). */
+    17→export const CARD_W = 220;
+    18→export const CARD_H = 96;
+    19→
+    20→/**
+    21→ * INFINITE CANVAS — the workspace is unbounded: job coordinates may be
+    22→ * negative or arbitrarily large, the dot grid follows the viewport, and
+    23→ * the edge/minimap layers size themselves to the content. These bounds
+    24→ * are pure defensive guards against pathological values (NaN traps,
+    25→ * database overflow), not a usable canvas limit — ±20,000 px is ~90
+    26→ * screens of panning in every direction.
+    27→ */
+    28→export const WORLD_MIN = -20_000;
+    29→export const WORLD_MAX = 20_000;
+    30→
+    31→/** Zoom limits for the canvas viewport (free zoom-to-cursor canvas). */
+    32→export const ZOOM_MIN = 0.25;
+    33→export const ZOOM_MAX = 2.2;
+    34→export const ZOOM_STEP = 0.1;
+    35→
+    36→/* ------------------------------------------------------------------ */
+    37→/* Param shorthands                                                    */
+    38→/* ------------------------------------------------------------------ */
+    39→
+    40→const num = (
+    41→  key: string,
+    42→  label: string,
+    43→  def: number,
+    44→  extra?: Partial<ParamSchema>
+    45→): ParamSchema => ({ key, label, type: "number", default: def, ...extra });
+    46→
+    47→const sel = (
+    48→  key: string,
+    49→  label: string,
+    50→  def: string,
+    51→  options: string[],
+    52→  extra?: Partial<ParamSchema>
+    53→): ParamSchema => ({ key, label, type: "select", default: def, options, ...extra });
+    54→
+    55→const bool = (
+    56→  key: string,
+    57→  label: string,
+    58→  def: boolean,
+    59→  extra?: Partial<ParamSchema>
+    60→): ParamSchema => ({ key, label, type: "bool", default: def, ...extra });
+    61→
+    62→/** Free-form text parameter (comma lists, names, engine directives). */
+    63→const txt = (
+    64→  key: string,
+    65→  label: string,
+    66→  def: string,
+    67→  extra?: Partial<ParamSchema>
+    68→): ParamSchema => ({ key, label, type: "text", default: def, ...extra });
+    69→
+    70→/** Filesystem folder parameter — rendered with a native Browse… dialog. */
+    71→const pth = (
+    72→  key: string,
+    73→  label: string,
+    74→  extra?: Partial<ParamSchema>
+    75→): ParamSchema => ({ key, label, type: "path", default: "", ...extra });
+    76→
+    77→const symmetryOptions = ["C1", "C2", "C4", "D2", "T", "I"];
+    78→const psiOptions = ["30", "15", "7.5", "3.75", "1.875"];
+    79→
+    80→/* ------------------------------------------------------------------ */
+    81→/* Palette categories (RELION job-browser tree)                        */
+    82→/* ------------------------------------------------------------------ */
+    83→
+    84→export interface JobCategory {
+    85→  key: string;
+    86→  label: string;
+    87→  hint: string;
+    88→}
+    89→
+    90→export const JOB_CATEGORIES: JobCategory[] = [
+    91→  { key: "import", label: "Import", hint: "Movies · micrographs · particles" },
+    92→  { key: "motion", label: "Motion", hint: "Beam-induced motion correction" },
+    93→  { key: "ctf", label: "CTF", hint: "Estimation & refinement" },
+    94→  { key: "picking", label: "Picking", hint: "Manual & automated detection" },
+    95→  { key: "extract", label: "Extraction", hint: "Boxing · rescaling · subtraction" },
+    96→  { key: "select", label: "Selection", hint: "Subsets & STAR handling" },
+    97→  { key: "class2d", label: "2D Classification", hint: "Multi-reference averaging" },
+    98→  { key: "class3d", label: "3D Classification", hint: "Initial models & sorting" },
+    99→  { key: "refine", label: "3D Refinement", hint: "Auto-refine · multibody" },
+   100→  { key: "orientation", label: "Orientation", hint: "Symmetry expansion · rebalancing" },
+   101→  { key: "postprocess", label: "3D Postprocess", hint: "Masks · sharpening · local res" },
+   102→  { key: "polish", label: "Polish & CTF", hint: "Per-particle refinements" },
+   103→  { key: "tomo", label: "Tomography", hint: "Tilt series · subtomograms" },
+   104→  { key: "external", label: "External", hint: "Custom & deep-learning tools" },
+   105→];
+   106→
+   107→/* ------------------------------------------------------------------ */
+   108→/* Port colors by data kind (no blue/indigo anywhere)                  */
+   109→/* ------------------------------------------------------------------ */
+   110→
+   111→export const PORT_COLORS: Record<PortKind, { dot: string; label: string; text: string }> = {
+   112→  movies: { dot: "bg-cyan-500", label: "text-cyan-700 dark:text-cyan-300", text: "Cyan" },
+   113→  micrographs: { dot: "bg-teal-500", label: "text-teal-700 dark:text-teal-300", text: "Teal" },
+   114→  coords: { dot: "bg-amber-500", label: "text-amber-700 dark:text-amber-300", text: "Amber" },
+   115→  particles: { dot: "bg-violet-500", label: "text-violet-700 dark:text-violet-300", text: "Violet" },
+   116→  references2d: { dot: "bg-rose-500", label: "text-rose-700 dark:text-rose-300", text: "Rose" },
+   117→  volume: { dot: "bg-orange-500", label: "text-orange-700 dark:text-orange-300", text: "Orange" },
+   118→  halfmap: { dot: "bg-pink-500", label: "text-pink-700 dark:text-pink-300", text: "Pink" },
+   119→  mask: { dot: "bg-emerald-500", label: "text-emerald-700 dark:text-emerald-300", text: "Emerald" },
+   120→  star: { dot: "bg-slate-500", label: "text-slate-700 dark:text-slate-300", text: "Slate" },
+   121→  tiltseries: { dot: "bg-cyan-500", label: "text-cyan-700 dark:text-cyan-300", text: "Cyan" },
+   122→  tomograms: { dot: "bg-teal-500", label: "text-teal-700 dark:text-teal-300", text: "Teal" },
+   123→};
+   124→
+   125→/** Port shorthands. */
+   126→const inp = (name: string, label: string, accepts: (PortKind | "*")[], multiple = false): PortSpec => ({
+   127→  name,
+   128→  label,
+   129→  accepts,
+   130→  multiple,
+   131→});
+   132→
+   133→const outp = (name: string, label: string, kind: PortKind): PortSpec => ({ name, label, kind });
+   134→
+   135→/** Standard port labels (RELION wording). */
+   136→const L = {
+   137→  moviesIn: "Input movies STAR file (.star)",
+   138→  micIn: "Input micrographs STAR file (.star)",
+   139→  particlesIn: "Input images STAR file (.star)",
+   140→  coordsOut: "Picked coordinates (.coord)",
+   141→  particlesOut: "Particles STAR file (.star)",
+   142→  optParticlesOut: "Optimised particles STAR file (.star)",
+   143→  classAveragesOut: "Class averages (.mrcs)",
+   144→  mapIn: "Reference map (.mrc)",
+   145→  mapOut: "Refined map (.mrc)",
+   146→  half1In: "Unfiltered half-map 1 (.mrc)",
+   147→  half2In: "Unfiltered half-map 2 (.mrc)",
+   148→  maskIn: "Solvent mask (.mrc)",
+   149→  maskOut: "Output mask (.mrc)",
+   150→  tiltIn: "Input tilt-series STAR file (.star)",
+   151→  tiltOut: "Aligned tilt-series STAR file (.star)",
+   152→  tomoIn: "Input tomograms STAR file (.star)",
+   153→  tomoOut: "Tomograms STAR file (.star)",
+   154→};
+   155→
+   156→/* ------------------------------------------------------------------ */
+   157→/* Colors                                                              */
+   158→/* ------------------------------------------------------------------ */
+   159→
+   160→const COLORS = {
+   161→  teal: {
+   162→    text: "text-teal-600 dark:text-teal-400",
+   163→    bg: "bg-teal-500",
+   164→    border: "border-teal-500",
+   165→    soft: "bg-teal-500/10",
+   166→  },
+   167→  violet: {
+   168→    text: "text-violet-600 dark:text-violet-400",
+   169→    bg: "bg-violet-500",
+   170→    border: "border-violet-500",
+   171→    soft: "bg-violet-500/10",
+   172→  },
+   173→  amber: {
+   174→    text: "text-amber-600 dark:text-amber-400",
+   175→    bg: "bg-amber-500",
+   176→    border: "border-amber-500",
+   177→    soft: "bg-amber-500/10",
+   178→  },
+   179→  rose: {
+   180→    text: "text-rose-600 dark:text-rose-400",
+   181→    bg: "bg-rose-500",
+   182→    border: "border-rose-500",
+   183→    soft: "bg-rose-500/10",
+   184→  },
+   185→  orange: {
+   186→    text: "text-orange-600 dark:text-orange-400",
+   187→    bg: "bg-orange-500",
+   188→    border: "border-orange-500",
+   189→    soft: "bg-orange-500/10",
+   190→  },
+   191→  emerald: {
+   192→    text: "text-emerald-600 dark:text-emerald-400",
+   193→    bg: "bg-emerald-500",
+   194→    border: "border-emerald-500",
+   195→    soft: "bg-emerald-500/10",
+   196→  },
+   197→  green: {
+   198→    text: "text-green-600 dark:text-green-400",
+   199→    bg: "bg-green-500",
+   200→    border: "border-green-500",
+   201→    soft: "bg-green-500/10",
+   202→  },
+   203→  cyan: {
+   204→    text: "text-cyan-600 dark:text-cyan-400",
+   205→    bg: "bg-cyan-500",
+   206→    border: "border-cyan-500",
+   207→    soft: "bg-cyan-500/10",
+   208→  },
+   209→  slate: {
+   210→    text: "text-slate-600 dark:text-slate-400",
+   211→    bg: "bg-slate-500",
+   212→    border: "border-slate-500",
+   213→    soft: "bg-slate-500/10",
+   214→  },
+   215→  pink: {
+   216→    text: "text-pink-600 dark:text-pink-400",
+   217→    bg: "bg-pink-500",
+   218→    border: "border-pink-500",
+   219→    soft: "bg-pink-500/10",
+   220→  },
+   221→} as const;
+   222→
+   223→type ColorName = keyof typeof COLORS;
+   224→
+   225→interface SpecOpts {
+   226→  category?: string;
+   227→  group?: string;
+   228→  tabs?: string[];
+   229→  inputs?: PortSpec[];
+   230→  outputs?: PortSpec[];
+   231→}
+   232→
+   233→const spec = (
+   234→  key: string,
+   235→  label: string,
+   236→  icon: string,
+   237→  color: ColorName,
+   238→  description: string,
+   239→  duration: number,
+   240→  params: ParamSchema[],
+   241→  resultTemplate: string,
+   242→  tier: JobTier,
+   243→  opts: SpecOpts = {}
+   244→): JobTypeSpec => ({
+   245→  key,
+   246→  label,
+   247→  group: opts.group ?? "SPA",
+   248→  category: opts.category ?? "external",
+   249→  icon,
+   250→  color: COLORS[color],
+   251→  description,
+   252→  duration,
+   253→  tabs: opts.tabs ?? [],
+   254→  inputs: opts.inputs ?? [],
+   255→  outputs: opts.outputs ?? [],
+   256→  params,
+   257→  resultTemplate,
+   258→  tier,
+   259→});
+   260→
+   261→/* ------------------------------------------------------------------ */
+   262→/* The catalog                                                         */
+   263→/* ------------------------------------------------------------------ */
+   264→
+   265→export const JOB_TYPES: JobTypeSpec[] = [
+   266→  /* ---------------- Import ------------------------------------------ */
+   267→  spec(
+   268→    "import",
+   269→    "Import Movies / Micrographs",
+   270→    "FolderInput",
+   271→    "teal",
+   272→    "Ingest movies or micrograph metadata into the project as a RELION 5 optics-group STAR file.",
+   273→    2000,
+   274→    [
+   275→      pth("micrographsPath", "Micrographs — folder, pattern or files", {
+   276→        hint: "RELION-style: pick a folder (imports every image), a wildcard pattern (/data/movies/*.tiff — * and ? allowed), or Browse → Files to multi-select individual files. Local drives and WSL paths both work (/mnt/c/… or C:\\…).",
+   277→        tab: "Movies/mics",
+   278→        filePick: true,
+   279→      }),
+   280→      num("pixelSize", "Pixel size", 1.77, { unit: "Å", min: 0.1, step: 0.01, tab: "Movies/mics" }),
+   281→      num("voltage", "Voltage", 300, { unit: "kV", tab: "Movies/mics" }),
+   282→      num("cs", "Spherical aberration", 2.7, { unit: "mm", step: 0.1, tab: "Movies/mics" }),
+   283→      num("ampContrast", "Amplitude contrast", 0.1, { step: 0.01, min: 0.01, max: 0.3, tab: "Movies/mics" }),
+   284→      num("totalDose", "Total exposure dose", 25, { unit: "e⁻/Å²", step: 0.5, advanced: true, tab: "Movies/mics" }),
+   285→    ],
+   286→    "{n} micrographs imported",
+   287→    "core",
+   288→    {
+   289→      category: "import",
+   290→      tabs: ["Movies/mics"],
+   291→      inputs: [],
+   292→      outputs: [outp("micrographs", "Micrographs STAR file (.star)", "micrographs")],
+   293→    }
+   294→  ),
+   295→
+   296→  /* ---------------- Motion ------------------------------------------ */
+   297→  spec(
+   298→    "motioncorr",
+   299→    "Motion Correction",
+   300→    "Wind",
+   301→    "violet",
+   302→    "Correct beam-induced specimen motion with MotionCor2 patch-based alignment (external binary).",
+   303→    9000,
+   304→    [
+   305→      num("patchX", "Patch X", 5, { min: 1, tab: "Motion" }),
+   306→      num("patchY", "Patch Y", 5, { min: 1, tab: "Motion" }),
+   307→      num("bfactor", "B-factor", 150, { step: 10, tab: "Motion", advanced: true }),
+   308→      num("dosePerFrame", "Dose per frame", 1.28, { unit: "e⁻/Å²", step: 0.01, tab: "Motion" }),
+   309→    ],
+   310→    "{n} movies corrected",
+   311→    "external",
+   312→    {
+   313→      category: "motion",
+   314→      tabs: ["Motion", "Compute"],
+   315→      inputs: [inp("movies", L.moviesIn, ["movies", "micrographs"])],
+   316→      outputs: [outp("micrographs", "Corrected micrographs STAR (.star)", "micrographs")],
+   317→    }
+   318→  ),
+   319→
+   320→  /* ---------------- CTF --------------------------------------------- */
+   321→  spec(
+   322→    "ctffind",
+   323→    "CTF Estimation",
+   324→    "Aperture",
+   325→    "amber",
+   326→    "Estimate the contrast transfer function per micrograph with CTFFIND-4.x power-spectrum fits.",
+   327→    5000,
+   328→    [
+   329→      num("box", "CTF box size", 512, { step: 32, min: 64, max: 2048, unit: "px", tab: "CTFFIND-4.1" }),
+   330→      num("resMin", "Minimum resolution", 30, { unit: "Å", min: 5, max: 100, tab: "CTFFIND-4.1" }),
+   331→      num("resMax", "Maximum resolution", 5, { unit: "Å", min: 1, max: 30, tab: "CTFFIND-4.1" }),
+   332→      num("dFMin", "Defocus search lower limit", 5000, { unit: "Å", step: 500, tab: "CTFFIND-4.1" }),
+   333→      num("dFMax", "Defocus search upper limit", 50000, { unit: "Å", step: 500, tab: "CTFFIND-4.1" }),
+   334→      bool("fitAstig", "Find astigmatism", true, { tab: "CTFFIND-4.1", advanced: true }),
+   335→      bool("phaseShift", "Estimate phase shifts", false, { tab: "CTFFIND-4.1", advanced: true }),
+   336→    ],
+   337→    "CTF fitted, {n} micrographs",
+   338→    "core",
+   339→    {
+   340→      category: "ctf",
+   341→      tabs: ["CTFFIND-4.1"],
+   342→      inputs: [inp("micrographs", L.micIn, ["micrographs"])],
+   343→      outputs: [outp("micrographs", "CTF-estimated micrographs STAR", "micrographs")],
+   344→    }
+   345→  ),
+   346→
+   347→  /* ---------------- Picking ----------------------------------------- */
+   348→  spec(
+   349→    "manualpick",
+   350→    "Manual Picking",
+   351→    "Crosshair",
+   352→    "rose",
+   353→    "Pick particles manually on micrographs (Henderson-style .coord files are imported natively).",
+   354→    2500,
+   355→    [
+   356→      num("particleDiameter", "Particle diameter for picking", 180, { unit: "Å", step: 5, tab: "Display" }),
+   357→      num("lowpass", "Lowpass filter", 20, { unit: "Å", step: 5, tab: "Display" }),
+   358→      num("sigmaContrast", "Sigma contrast black ring", 3, { step: 0.5, tab: "Display" }),
+   359→      num("particleDiameterScale", "Particle diameter scale", 1, { step: 0.1, min: 0.5, max: 3, tab: "Display", advanced: true }),
+   360→    ],
+   361→    "{n} particles picked",
+   362→    "core",
+   363→    {
+   364→      category: "picking",
+   365→      tabs: ["Display", "Colors"],
+   366→      inputs: [inp("micrographs", L.micIn, ["micrographs"])],
+   367→      outputs: [outp("coords", L.coordsOut, "coords")],
+   368→    }
+   369→  ),
+   370→  spec(
+   371→    "autopick",
+   372→    "Automated Picking",
+   373→    "Search",
+   374→    "rose",
+   375→    "Reference-free Laplacian-of-Gaussian picking (no templates needed), or template matching with 2D references.",
+   376→    7000,
+   377→    [
+   378→      sel("pickingMethod", "Picking method", "Laplacian of Gaussian", ["Laplacian of Gaussian", "References"], {
+   379→        tab: "autopicking",
+   380→        hint: "Laplacian-of-Gaussian needs no references — pick straight after CTF. References mode needs Class2D averages.",
+   381→      }),
+   382→      num("logDiamMin", "LoG min particle diameter", 120, { unit: "Å", step: 5, tab: "Laplacian", hint: "smallest blob the DoG filter responds to" }),
+   383→      num("logDiamMax", "LoG max particle diameter", 180, { unit: "Å", step: 5, tab: "Laplacian", hint: "largest blob the DoG filter responds to" }),
+   384→      num("logAdjustThreshold", "LoG adjust threshold", 0, { step: 0.05, tab: "Laplacian", hint: "positive picks fewer, negative picks more" }),
+   385→      num("logUpperThreshold", "LoG upper threshold limit", 99999, { step: 1, tab: "Laplacian", advanced: true }),
+   386→      bool("logInvert", "Particles are white (not black)", false, { tab: "Laplacian", advanced: true }),
+   387→      num("particleDiameter", "Particle diameter (pick mask)", 180, { unit: "Å", step: 5, tab: "References" }),
+   388→      num("lowpass", "Lowpass filter for references", 20, { unit: "Å", step: 5, tab: "References" }),
+   389→      num("threshold", "Picking threshold (References mode)", 0.4, { step: 0.05, min: 0, max: 1, tab: "autopicking" }),
+   390→      num("minDistance", "Minimum inter-particle distance", 100, { unit: "Å", step: 10, min: 0, tab: "autopicking", advanced: true }),
+   391→      num("maxStddevNoise", "Maximum stddev of noise", 0, { step: 0.05, min: 0, tab: "autopicking", advanced: true }),
+   392→    ],
+   393→    "{n} particles picked",
+   394→    "cmd",
+   395→    {
+   396→      category: "picking",
+   397→      tabs: ["Laplacian", "References", "autopicking", "Topaz"],
+   398→      inputs: [
+   399→        inp("micrographs", L.micIn, ["micrographs"]),
+   400→        inp("references", "2D references (References mode)", ["references2d"]),
+   401→      ],
+   402→      outputs: [outp("coords", L.coordsOut, "coords")],
+   403→    }
+   404→  ),
+   405→
+   406→  /* ---------------- Extraction -------------------------------------- */
+   407→  spec(
+   408→    "extract",
+   409→    "Particle Extraction",
+   410→    "Crop",
+   411→    "orange",
+   412→    "Box picked particles out of micrographs, normalize and optionally downscale the stacks.",
+   413→    3000,
+   414→    [
+   415→      num("boxSize", "Particle box size", 128, { step: 8, min: 32, max: 512, unit: "px", tab: "extract" }),
+   416→      num("downsampleTo", "Rescale to box size", 64, { step: 8, min: 0, max: 512, unit: "px", tab: "extract", hint: "0 = keep original box" }),
+   417→      num("bgDiameter", "Diameter background circle", -1, { unit: "px", tab: "extract", hint: "-1 = 0.75 × box" }),
+   418→      bool("norm", "Normalise particles", true, { tab: "extract", advanced: true }),
+   419→    ],
+   420→    "{n} particles extracted",
+   421→    "core",
+   422→    {
+   423→      category: "extract",
+   424→      tabs: ["extract"],
+   425→      inputs: [
+   426→        inp("micrographs", L.micIn, ["micrographs"]),
+   427→        inp("coords", "Particle coordinates (.coord)", ["coords"]),
+   428→      ],
+   429→      outputs: [outp("particles", L.particlesOut, "particles")],
+   430→    }
+   431→  ),
+   432→  spec(
+   433→    "subtract",
+   434→    "Signal Subtraction",
+   435→    "Scissors",
+   436→    "amber",
+   437→    "Subtract masked signal from particles for focused classification/refinement.",
+   438→    5000,
+   439→    [
+   440→      num("newBox", "New box size", -1, { unit: "px", step: 32, tab: "Reference", hint: "-1 keeps box" }),
+   441→      bool("recenter", "Re-center on mask", true, { tab: "Reference" }),
+   442→      bool("float16", "Write output in float16", true, { tab: "Reference", advanced: true }),
+   443→    ],
+   444→    "{n} particles subtracted",
+   445→    "cmd",
+   446→    {
+   447→      category: "extract",
+   448→      tabs: ["Reference"],
+   449→      inputs: [
+   450→        inp("particles", L.particlesIn, ["particles"]),
+   451→        inp("reference", "3D map to subtract (.mrc)", ["volume"]),
+   452→      ],
+   453→      outputs: [outp("particles", "Subtracted particles STAR", "particles")],
+   454→    }
+   455→  ),
+   456→
+   457→  /* ---------------- Selection --------------------------------------- */
+   458→  spec(
+   459→    "select",
+   460→    "Particle Selection",
+   461→    "ListFilter",
+   462→    "orange",
+   463→    "Select a particle subset from a larger STAR file (class-based, statistics or first-N).",
+   464→    1500,
+   465→    [
+   466→      num("maxParticles", "Max particles", 1000, { step: 100, min: 1, tab: "Subsets" }),
+   467→      num("classCutoff", "Class occupancy cutoff", 0.5, {
+   468→        step: 0.05, min: 0, max: 1, tab: "Subsets",
+   469→        hint: "when input has _rlnClassNumber: keep classes with ≥ this fraction of the largest class occupancy (0 = keep all classes)",
+   470→      }),
+   471→      num("discardSigma", "Discard sigma", 4, { step: 0.5, min: 1, max: 10, tab: "Subsets", advanced: true }),
+   472→      num("duplicateThreshold", "Min inter-particle distance", 30, { unit: "Å", step: 5, tab: "Duplicates", advanced: true }),
+   473→    ],
+   474→    "{n} particles selected",
+   475→    "core",
+   476→    {
+   477→      category: "select",
+   478→      tabs: ["Subsets", "Duplicates"],
+   479→      inputs: [inp("particles", "Input STAR file(s)", ["particles", "micrographs", "movies"], true)],
+   480→      outputs: [outp("particles", "Selected particles STAR", "particles")],
+   481→    }
+   482→  ),
+   483→  spec(
+   484→    "joinstar",
+   485→    "Join STAR Files",
+   486→    "Merge",
+   487→    "teal",
+   488→    "Combine multiple particle, micrograph or movie STAR files into one (relion_star_handler).",
+   489→    2000,
+   490→    [
+   491→      sel("selectKind", "File type", "particles", ["particles", "micrographs", "movies"], { tab: "I/O" }),
+   492→      bool("randomize", "Randomise order", false, { tab: "Duplicates", advanced: true }),
+   493→      bool("removeDuplicates", "Remove duplicates", false, { tab: "Duplicates" }),
+   494→    ],
+   495→    "{n} items joined",
+   496→    "cmd",
+   497→    {
+   498→      category: "select",
+   499→      tabs: ["I/O", "Duplicates"],
+   500→      inputs: [inp("inputs", "Input STAR files (any)", ["particles", "micrographs", "movies", "star"], true)],
+   501→      outputs: [outp("output", "Joined STAR file", "star")],
+   502→    }
+   503→  ),
+   504→
+   505→  /* ---------------- 2D classification ------------------------------- */
+   506→  spec(
+   507→    "class2d",
+   508→    "2D Classification",
+   509→    "LayoutGrid",
+   510→    "emerald",
+   511→    "Multi-reference 2D class averaging (relion_refine) to separate good particles from junk.",
+   512→    12000,
+   513→    [
+   514→      num("numClasses", "Number of classes (K)", 10, { step: 1, min: 1, max: 200, tab: "Optimisation" }),
+   515→      num("iterations", "Number of iterations", 12, { step: 1, min: 1, max: 50, tab: "Optimisation" }),
+   516→      num("particleDiameter", "Circular mask diameter", 180, { unit: "Å", step: 5, tab: "Optimisation" }),
+   517→      num("tau2Fudge", "Regularisation factor T", 1, { step: 0.5, min: 0.5, tab: "Optimisation", advanced: true }),
+   518→      bool("doZeroMask", "Zero the mask", true, { tab: "Optimisation", advanced: true }),
+   519→      sel("psiSampling", "In-plane sampling step", "7.5", psiOptions, { tab: "Sampling", advanced: true }),
+   520→      num("highresLimit", "High-res limit (Å)", 0, { step: 0.5, min: 0, tab: "Optimisation", advanced: true, hint: "0 = no limit" }),
+   521→      num("threads", "Threads (--j)", 4, {
+   522→        step: 1, min: 1, max: 32, tab: "Compute",
+   523→        hint: "relion_refine runs single-rank (MPI stacks under WSL are fragile) — this is the parallelism knob",
+   524→      }),
+   525→    ],
+   526→    "{n} class averages",
+   527→    "core",
+   528→    {
+   529→      category: "class2d",
+   530→      tabs: ["CTF", "Optimisation", "Sampling", "Compute"],
+   531→      inputs: [inp("particles", L.particlesIn, ["particles"])],
+   532→      outputs: [
+   533→        outp("classAverages", L.classAveragesOut, "references2d"),
+   534→        outp("particles", L.optParticlesOut, "particles"),
+   535→      ],
+   536→    }
+   537→  ),
+   538→  spec(
+   539→    "select2d",
+   540→    "2D Class Selection",
+   541→    "Grid2x2Check",
+   542→    "orange",
+   543→    "Subset-selection on a 2D classification run: pick good classes from the gallery (or auto-select by occupancy) — only particles in the kept classes continue downstream.",
+   544→    900,
+   545→    [
+   546→      txt("selectedClasses", "Selected classes", "auto", {
+   547→        tab: "Classes",
+   548→        hint: "'auto' keeps classes with occupancy ≥ cutoff × best · or an explicit comma list like 1,2,5 — driven by the gallery below",
+   549→      }),
+   550→      num("occupancyCutoff", "Auto-mode occupancy cutoff", 0.5, {
+   551→        step: 0.05, min: 0, max: 1, tab: "Classes",
+   552→        hint: "auto-selection: keep classes whose particle count is at least this fraction of the largest class",
+   553→      }),
+   554→    ],
+   555→    "{n} particles kept",
+   556→    "core",
+   557→    {
+   558→      category: "class2d",
+   559→      tabs: ["Classes"],
+   560→      inputs: [
+   561→        inp("particles", "Classified particles STAR (run 2D Classification first)", ["particles"]),
+   562→        inp("classes", "2D class averages (gallery)", ["references2d"]),
+   563→      ],
+   564→      outputs: [outp("particles", "Selected particles STAR file (.star)", "particles")],
+   565→    }
+   566→  ),
+   567→
+   568→  /* ---------------- 3D classification & initial models -------------- */
+   569→  spec(
+   570→    "initialmodel",
+   571→    "3D Initial Model",
+   572→    "Layers",
+   573→    "green",
+   574→    "Generate ab-initio 3D references with the gradient-driven VDAM de-novo algorithm.",
+   575→    14000,
+   576→    [
+   577→      num("numClasses", "Number of classes (K)", 4, { min: 1, max: 20, tab: "Optimisation" }),
+   578→      sel("symmetry", "Symmetry", "D2", symmetryOptions, { tab: "Optimisation" }),
+   579→      num("iterations", "Number of VDAM iterations", 50, { step: 5, min: 5, max: 300, tab: "Optimisation" }),
+   580→      num("particleDiameter", "Circular mask diameter", 180, { unit: "Å", step: 5, tab: "Sampling" }),
+   581→      num("tau2Fudge", "Regularisation factor T", 1, { step: 0.5, min: 0.5, tab: "Optimisation", advanced: true }),
+   582→    ],
+   583→    "{n} initial models",
+   584→    "core",
+   585→    {
+   586→      category: "class3d",
+   587→      tabs: ["Optimisation", "Sampling", "Compute"],
+   588→      inputs: [inp("particles", L.particlesIn, ["particles"])],
+   589→      outputs: [outp("model", "Initial model(s) (.mrc)", "volume")],
+   590→    }
+   591→  ),
+   592→  spec(
+   593→    "class3d",
+   594→    "3D Classification",
+   595→    "Boxes",
+   596→    "green",
+   597→    "Sort particles into 3D conformational classes against a reference map.",
+   598→    14000,
+   599→    [
+   600→      num("numClasses", "Number of classes (K)", 4, { min: 1, max: 20, tab: "Optimisation" }),
+   601→      sel("symmetry", "Symmetry", "C1", symmetryOptions, { tab: "Reference" }),
+   602→      num("iterations", "Number of iterations", 25, { step: 5, min: 5, max: 100, tab: "Optimisation" }),
+   603→      num("particleDiameter", "Circular mask diameter", 180, { unit: "Å", step: 5, tab: "Sampling" }),
+   604→      num("tau2Fudge", "Regularisation factor T", 1, { step: 0.5, min: 0.5, tab: "Optimisation", advanced: true }),
+   605→      num("threads", "Threads (--j)", 4, {
+   606→        step: 1, min: 1, max: 32, tab: "Compute",
+   607→        hint: "applies to sequential (WSL-bridged) runs — native runs use MPI ranks instead",
+   608→      }),
+   609→    ],
+   610→    "{n} 3D classes",
+   611→    "cmd",
+   612→    {
+   613→      category: "class3d",
+   614→      tabs: ["Reference", "CTF", "Optimisation", "Sampling", "Compute"],
+   615→      inputs: [
+   616→        inp("particles", L.particlesIn, ["particles"]),
+   617→        inp("reference", L.mapIn, ["volume", "halfmap"]),
+   618→      ],
+   619→      outputs: [
+   620→        outp("model", "Class volumes (.mrc)", "volume"),
+   621→        outp("particles", L.optParticlesOut, "particles"),
+   622→      ],
+   623→    }
+   624→  ),
+   625→
+   626→  /* ---------------- 3D refinement ------------------------------------ */
+   627→  spec(
+   628→    "refine3d",
+   629→    "3D Auto-Refine",
+   630→    "Gem",
+   631→    "cyan",
+   632→    "Gold-standard angular refinement (relion_refine) with FSC-driven auto-stopping or fixed iters.",
+   633→    16000,
+   634→    [
+   635→      sel("symmetry", "Symmetry", "D2", symmetryOptions, { tab: "Reference" }),
+   636→      num("iniHigh", "Initial low-pass on reference", 30, {
+   637→        unit: "Å", step: 1, min: 5, max: 60, tab: "Reference",
+   638→        hint: "reference is filtered to this resolution before the first iteration",
+   639→      }),
+   640→      num("particleDiameter", "Circular mask diameter", 180, { unit: "Å", step: 5, tab: "Sampling" }),
+   641→      bool("autoRefine", "Perform auto-refinement", false, { tab: "Auto-sampling" }),
+   642→      num("iterations", "Number of iterations", 15, { step: 1, min: 1, max: 50, tab: "Optimisation", hint: "used when auto-refine is off" }),
+   643→      num("samplingStep", "Angular sampling step", 7.5, { step: 0.5, unit: "°", min: 0.5, max: 30, tab: "Auto-sampling", advanced: true }),
+   644→      num("tau2Fudge", "Regularisation factor T", 1, { step: 0.5, min: 0.5, tab: "Optimisation", advanced: true }),
+   645→      num("padding", "Padding factor", 2, {
+   646→        step: 1, min: 1, max: 2, tab: "Compute", advanced: true,
+   647→        hint: "FFT padding 2 = accurate interpolation, 1 = 4× faster (large boxes)",
+   648→      }),
+   649→    ],
+   650→    "Refined to {n} Å",
+   651→    "core",
+   652→    {
+   653→      category: "refine",
+   654→      tabs: ["Reference", "Optimisation", "Sampling", "Auto-sampling", "Compute"],
+   655→      inputs: [
+   656→        inp("particles", L.particlesIn, ["particles"]),
+   657→        inp("reference", L.mapIn, ["volume", "halfmap"]),
+   658→      ],
+   659→      outputs: [
+   660→        outp("half1", "Unfiltered half-map 1 (.mrc)", "halfmap"),
+   661→        outp("half2", "Unfiltered half-map 2 (.mrc)", "halfmap"),
+   662→        outp("map", L.mapOut, "volume"),
+   663→        outp("particles", L.optParticlesOut, "particles"),
+   664→      ],
+   665→    }
+   666→  ),
+   667→  spec(
+   668→    "multibody",
+   669→    "Multi-Body Refinement",
+   670→    "Combine",
+   671→    "cyan",
+   672→    "Refine bodies of a multi-domain complex independently against body masks.",
+   673→    18000,
+   674→    [
+   675→      num("numBodies", "Number of bodies", 2, { min: 1, max: 20, tab: "Optimisation" }),
+   676→      sel("symmetry", "Symmetry", "C1", symmetryOptions, { tab: "Reference" }),
+   677→      num("particleDiameter", "Circular mask diameter", 180, { unit: "Å", step: 5, tab: "Sampling" }),
+   678→      num("offsetStep", "Offset search step", 2, { unit: "px", step: 1, min: 1, max: 10, tab: "Sampling", advanced: true }),
+   679→    ],
+   680→    "{n} bodies refined",
+   681→    "cmd",
+   682→    {
+   683→      category: "refine",
+   684→      tabs: ["Reference", "Optimisation", "Sampling", "Compute"],
+   685→      inputs: [
+   686→        inp("particles", L.particlesIn, ["particles"]),
+   687→        inp("reference", L.mapIn, ["volume", "halfmap"]),
+   688→      ],
+   689→      outputs: [
+   690→        outp("bodies", "Body volumes (.mrc)", "volume"),
+   691→        outp("particles", L.optParticlesOut, "particles"),
+   692→      ],
+   693→    }
+   694→  ),
+   695→
+   696→  /* ---------------- Orientation: symmetry expansion & rebalancing --- */
+   697→  spec(
+   698→    "symexpand",
+   699→    "Symmetry Expansion",
+   700→    "Orbit",
+   701→    "cyan",
+   702→    "Expand particles across a point group's asymmetric units — every row is replicated |G|× with composed Euler angles (icosahedral subsets included). Ports the Jing0715-fer/icosahedral-symmetry-expander algorithm; a superset of relion_particle_symmetry_expand.",
+   703→    2500,
+   704→    [
+   705→      sel("symmetryGroup", "Point group", "I", [
+   706→        "I", "O", "T", "C2", "C3", "C4", "C5", "C6", "D1", "D2", "D3", "D4", "D5", "D6",
+   707→      ], {
+   708→        tab: "Symmetry",
+   709→        hint: "I = icosahedral (60 asymmetric units) · O = octahedral (24) · T = tetrahedral (12) · Cn/Dn cyclic & dihedral",
+   710→      }),
+   711→      sel("icoSubset", "Icosahedral subset (I only)", "full", ["full", "vertex", "face", "edge", "non_edge", "hemisphere"], {
+   712→        tab: "Symmetry",
+   713→        hint: "vertex 12 · face 20 · edge 30 · non_edge 42 · hemisphere 30 · full 60 rotations — subsets only apply to group I",
+   714→      }),
+   715→      bool("deduplicate", "Deduplicate rotations", true, {
+   716→        tab: "Symmetry",
+   717→        advanced: true,
+   718→        hint: "collapse numerically-identical group elements (matters for degenerate Cn/Dn specs)",
+   719→      }),
+   720→    ],
+   721→    "{n} particles expanded",
+   722→    "core",
+   723→    {
+   724→      category: "orientation",
+   725→      tabs: ["Symmetry"],
+   726→      inputs: [inp("particles", L.particlesIn, ["particles"])],
+   727→      outputs: [outp("particles", "Symmetry-expanded particles STAR", "particles")],
+   728→    }
+   729→  ),
+   730→  spec(
+   731→    "rebalance",
+   732→    "Orientation Rebalancer",
+   733→    "Scale",
+   734→    "cyan",
+   735→    "Balance the viewing-direction distribution of a particle stack: Fibonacci-sphere binning, 3DFSC-style resolution estimates and per-bin percentile trimming (loglik/maxprob/ncc/random exclusion). Ports the Jing0715-fer/Orient-Rebalancer algorithm.",
+   736→    2000,
+   737→    [
+   738→      num("numBins", "Orientation bins (Fibonacci sphere)", 200, {
+   739→        min: 20, max: 1000, step: 10, tab: "Binning",
+   740→        hint: "equal-area bins over the viewing sphere — more bins = finer anisotropy resolution",
+   741→      }),
+   742→      num("percentile", "Trim threshold percentile", 90, {
+   743→        unit: "%", min: 5, max: 100, step: 5, tab: "Trimming",
+   744→        hint: "per-bin keep-count = this percentile of non-empty bin counts (over-populated bins are trimmed down to it)",
+   745→      }),
+   746→      sel("exclusionCriterion", "Exclusion criterion", "loglik", ["loglik", "maxprob", "ncc", "random"], {
+   747→        tab: "Trimming",
+   748→        hint: "which per-particle score decides who leaves an over-populated bin: _rlnLogLikeliContribution, _rlnMaxValueProbDistribution, _rlnNormCorrection or seeded random (fallback when columns are absent)",
+   749→      }),
+   750→      sel("mode", "Threshold mode", "standard", ["standard", "resolution"], {
+   751→        tab: "Trimming",
+   752→        hint: "resolution mode scales per-bin thresholds by the 3DFSC estimate — bins BETTER than the median lose more, flattening the resolution field",
+   753→      }),
+   754→      num("resolutionWeight", "Resolution weight α", 1, {
+   755→        step: 0.1, min: 0, max: 5, tab: "Trimming", advanced: true,
+   756→        hint: "threshold_i = base × (res_i / medianRes)^α (resolution mode only)",
+   757→      }),
+   758→      num("seed", "Random seed", 1, { min: 0, step: 1, tab: "Trimming", advanced: true, hint: "reproducible random exclusion" }),
+   759→    ],
+   760→    "{n} particles rebalanced",
+   761→    "core",
+   762→    {
+   763→      category: "orientation",
+   764→      tabs: ["Binning", "Trimming"],
+   765→      inputs: [inp("particles", "Oriented particles STAR (rot/tilt angles)", ["particles"])],
+   766→      outputs: [outp("particles", "Rebalanced particles STAR", "particles")],
+   767→    }
+   768→  ),
+   769→
+   770→  /* ---------------- 3D postprocess ----------------------------------- */
+   771→  spec(
+   772→    "maskcreate",
+   773→    "Mask Creation",
+   774→    "CircleDot",
+   775→    "slate",
+   776→    "Build a soft-edged 3D mask around the density (relion_mask_create) for FSC and validation.",
+   777→    2500,
+   778→    [
+   779→      num("threshold", "Initial binarisation threshold", 0.02, { step: 0.01, min: 0.001, tab: "Mask" }),
+   780→      num("softEdge", "Soft edge width", 6, { unit: "px", min: 1, tab: "Mask" }),
+   781→      num("lowpass", "Lowpass filter", 15, { unit: "Å", step: 5, tab: "Mask", advanced: true }),
+   782→      num("extend", "Extend initial mask", 3, { unit: "px", min: 0, tab: "Mask" }),
+   783→    ],
+   784→    "Mask created",
+   785→    "core",
+   786→    {
+   787→      category: "postprocess",
+   788→      tabs: ["Mask"],
+   789→      inputs: [inp("map", "Input map (.mrc)", ["volume", "halfmap"])],
+   790→      outputs: [outp("mask", L.maskOut, "mask")],
+   791→    }
+   792→  ),
+   793→  spec(
+   794→    "postprocess",
+   795→    "Post-Processing",
+   796→    "Sparkles",
+   797→    "pink",
+   798→    "Sharpen, mask and B-factor weight the refined half-maps (relion_postprocess) for deposition.",
+   799→    4000,
+   800→    [
+   801→      bool("autoBfac", "Estimate B-factor automatically", true, { tab: "Sharpening" }),
+   802→      num("autobLowres", "Auto-B low-res limit", 10, { unit: "Å", step: 1, tab: "Sharpening" }),
+   803→      num("adhocBfac", "Ad-hoc B-factor", -100, { step: 25, unit: "Å²", tab: "Sharpening", advanced: true, hint: "used when auto-B is off" }),
+   804→      num("randomizeFrom", "Randomize phases from", 10, { unit: "Å", step: 1, tab: "Sharpening", advanced: true }),
+   805→    ],
+   806→    "Sharpened map, {n} Å",
+   807→    "core",
+   808→    {
+   809→      category: "postprocess",
+   810→      tabs: ["Sharpening"],
+   811→      inputs: [
+   812→        inp("half1", L.half1In, ["halfmap", "volume"]),
+   813→        inp("half2", L.half2In, ["halfmap", "volume"]),
+   814→        inp("mask", L.maskIn, ["mask"]),
+   815→      ],
+   816→      outputs: [outp("map", "Sharpened map (.mrc)", "volume")],
+   817→    }
+   818→  ),
+   819→  spec(
+   820→    "localres",
+   821→    "Local Resolution",
+   822→    "Gauge",
+   823→    "pink",
+   824→    "Estimate per-voxel resolution with RELION's sliding-window postprocess or ResMap.",
+   825→    9000,
+   826→    [
+   827→      sel("method", "Method", "Relion", ["Relion", "ResMap"], { tab: "Relion" }),
+   828→      num("adhocBfac", "Ad-hoc B-factor", -100, { step: 25, tab: "Relion" }),
+   829→      num("pval", "P-value", 0.05, { step: 0.01, min: 0.01, max: 0.5, tab: "Relion", advanced: true }),
+   830→    ],
+   831→    "Local resolution to {n} Å",
+   832→    "cmd",
+   833→    {
+   834→      category: "postprocess",
+   835→      tabs: ["Relion"],
+   836→      inputs: [
+   837→        inp("half1", L.half1In, ["halfmap", "volume"]),
+   838→        inp("half2", L.half2In, ["halfmap", "volume"]),
+   839→        inp("mask", L.maskIn, ["mask"]),
+   840→      ],
+   841→      outputs: [outp("map", "Local-resolution map (.mrc)", "volume")],
+   842→    }
+   843→  ),
+   844→
+   845→  /* ---------------- Polish & CTF refinement -------------------------- */
+   846→  spec(
+   847→    "polish",
+   848→    "Bayesian Polishing",
+   849→    "Wand2",
+   850→    "violet",
+   851→    "Per-particle motion correction and radiation-damage weighting (relion_motion_refine).",
+   852→    15000,
+   853→    [
+   854→      num("evalFrac", "Fourier-eval fraction", 0.5, { step: 0.05, min: 0.1, max: 0.9, tab: "Polish" }),
+   855→      num("firstFrame", "First frame", 1, { min: 1, tab: "Polish", advanced: true }),
+   856→      num("lastFrame", "Last frame", 24, { min: 1, tab: "Polish", advanced: true }),
+   857→    ],
+   858→    "Polished to {n} Å",
+   859→    "cmd",
+   860→    {
+   861→      category: "polish",
+   862→      tabs: ["Polish", "Optimisation"],
+   863→      inputs: [
+   864→        inp("particles", L.particlesIn, ["particles"]),
+   865→        inp("reference", "Postprocessed map (.mrc)", ["volume"]),
+   866→      ],
+   867→      outputs: [outp("particles", "Polished (shiny) particles STAR", "particles")],
+   868→    }
+   869→  ),
+   870→  spec(
+   871→    "ctfrefine",
+   872→    "CTF Refinement",
+   873→    "Focus",
+   874→    "amber",
+   875→    "Per-particle defocus, astigmatism and higher-order aberration refinement (relion_ctf_refine).",
+   876→    10000,
+   877→    [
+   878→      num("minres", "Minimum resolution to fit", 20, { unit: "Å", step: 5, tab: "CTF" }),
+   879→      bool("fitDefocus", "Fit per-particle defocus", true, { tab: "CTF" }),
+   880→      bool("fitAstig", "Fit per-particle astigmatism", false, { tab: "CTF" }),
+   881→      bool("beamtilt", "Fit beam tilt", false, { tab: "CTF", advanced: true }),
+   882→    ],
+   883→    "CTF refined, {n} particles",
+   884→    "cmd",
+   885→    {
+   886→      category: "polish",
+   887→      tabs: ["CTF", "Optimisation", "Compute"],
+   888→      inputs: [
+   889→        inp("particles", L.particlesIn, ["particles"]),
+   890→        inp("reference", L.mapIn, ["volume", "halfmap"]),
+   891→      ],
+   892→      outputs: [outp("particles", "CTF-refined particles STAR", "particles")],
+   893→    }
+   894→  ),
+   895→
+   896→  /* ---------------- External / deep learning ------------------------- */
+   897→  spec(
+   898→    "dynamight",
+   899→    "DynaMight",
+   900→    "Waves",
+   901→    "violet",
+   902→    "Continuous-flexibility analysis with the DynaMight neural network (python + torch required).",
+   903→    20000,
+   904→    [
+   905→      num("nGaussians", "Number of Gaussians", 10000, { step: 1000, min: 1000, tab: "Optimisation" }),
+   906→      num("regFactor", "Regularization factor", 1, { step: 0.1, min: 0.2, tab: "Optimisation" }),
+   907→      num("nThreads", "Threads", 4, { min: 1, max: 32, tab: "Compute" }),
+   908→    ],
+   909→    "{n} deformations optimised",
+   910→    "external",
+   911→    {
+   912→      category: "external",
+   913→      tabs: ["Optimisation", "Compute"],
+   914→      inputs: [inp("particles", L.particlesIn, ["particles"])],
+   915→      outputs: [outp("particles", "Displacement-encoded particles STAR", "particles")],
+   916→    }
+   917→  ),
+   918→  spec(
+   919→    "modelangelo",
+   920→    "ModelAngelo",
+   921→    "Dna",
+   922→    "violet",
+   923→    "De-novo atomic model building into a cryo-EM map with ModelAngelo (python required).",
+   924→    22000,
+   925→    [
+   926→      sel("buildMode", "Build mode", "build_no_seq", ["build_no_seq", "build"], { tab: "Build" }),
+   927→      sel("gpuId", "GPU", "0", ["0", "1", "2", "3"], { tab: "Compute" }),
+   928→      bool("hhsearch", "HMM sequence search", false, { tab: "Build", advanced: true }),
+   929→    ],
+   930→    "{n} residues built",
+   931→    "external",
+   932→    {
+   933→      category: "external",
+   934→      tabs: ["Build", "Compute"],
+   935→      inputs: [inp("tomograms", "Input map / tomogram (.mrc)", ["tomograms", "volume", "halfmap"])],
+   936→      outputs: [outp("models", "Built models (mmCIF/PDB)", "star")],
+   937→    }
+   938→  ),
+   939→
+   940→  /* ------------------------------------------------------------------ */
+   941→  /* Tomography — 10                                                     */
+   942→  /* ------------------------------------------------------------------ */
+   943→  spec(
+   944→    "tomo_import",
+   945→    "Tomo: Import",
+   946→    "FolderOpen",
+   947→    "teal",
+   948→    "Import tilt series (SerialEM mdocs) and build the tomography STAR hierarchy.",
+   949→    2500,
+   950→    [
+   951→      num("pixelSize", "Nominal pixel size", 1.35, { unit: "Å", step: 0.01, tab: "Tilt series" }),
+   952→      num("voltage", "Voltage", 300, { unit: "kV", tab: "Tilt series" }),
+   953→      num("cs", "Spherical aberration", 2.7, { unit: "mm", step: 0.1, tab: "Tilt series" }),
+   954→      num("ampContrast", "Amplitude contrast", 0.1, { step: 0.01, min: 0.01, max: 0.3, tab: "Tilt series" }),
+   955→      num("doseRate", "Dose per tilt image", 3, { unit: "e⁻/Å²", step: 0.1, tab: "Tilt series" }),
+   956→    ],
+   957→    "{n} tilt series imported",
+   958→    "cmd",
+   959→    {
+   960→      category: "tomo",
+   961→      group: "Tomography",
+   962→      tabs: ["Tilt series"],
+   963→      inputs: [],
+   964→      outputs: [outp("tiltseries", "Tilt-series STAR file (.star)", "tiltseries")],
+   965→    }
+   966→  ),
+   967→  spec(
+   968→    "tomo_aligntiltseries",
+   969→    "Tomo: Align Tilt Series",
+   970→    "Move3d",
+   971→    "cyan",
+   972→    "Align tilt series with IMOD fiducials, IMOD patch-tracking or AreTomo2.",
+   973→    12000,
+   974→    [
+   975→      sel("method", "Method", "AreTomo2", ["AreTomo2", "IMOD fiducials", "IMOD patch-track"], { tab: "Motion" }),
+   976→      num("thickness", "Tomogram thickness", 300, { unit: "nm", step: 10, tab: "Motion" }),
+   977→      num("fiducialDiameter", "Fiducial diameter", 10, { unit: "nm", step: 1, tab: "Motion" }),
+   978→    ],
+   979→    "{n} tilt series aligned",
+   980→    "cmd",
+   981→    {
+   982→      category: "tomo",
+   983→      group: "Tomography",
+   984→      tabs: ["Motion"],
+   985→      inputs: [inp("tiltseries", L.tiltIn, ["tiltseries"])],
+   986→      outputs: [outp("tiltseries", L.tiltOut, "tiltseries")],
+   987→    }
+   988→  ),
+   989→  spec(
+   990→    "tomo_tomograms",
+   991→    "Tomo: Reconstruct Tomograms",
+   992→    "Box",
+   993→    "cyan",
+   994→    "Back-project aligned tilt series into 3D tomograms (relion_tomo_reconstruct_tomogram).",
+   995→    15000,
+   996→    [
+   997→      num("binnedAngpix", "Binned pixel size", 10, { unit: "Å", step: 1, min: 1, tab: "Reconstruct" }),
+   998→      num("xdim", "Width (x)", 1024, { step: 64, min: 256, tab: "Reconstruct" }),
+   999→      num("zdim", "Thickness (z)", 300, { unit: "px", step: 50, min: 50, tab: "Reconstruct" }),
+  1000→    ],
+  1001→    "{n} tomograms reconstructed",
+  1002→    "cmd",
+  1003→    {
+  1004→      category: "tomo",
+  1005→      group: "Tomography",
+  1006→      tabs: ["Reconstruct"],
+  1007→      inputs: [inp("tiltseries", L.tiltIn, ["tiltseries"])],
+  1008→      outputs: [outp("tomograms", L.tomoOut, "tomograms")],
+  1009→    }
+  1010→  ),
+  1011→  spec(
+  1012→    "tomo_ctfrefine",
+  1013→    "Tomo: CTF Refinement",
+  1014→    "Focus",
+  1015→    "amber",
+  1016→    "Refine tilt-series defoci and signal scale against reference maps (relion_tomo_refine_ctf).",
+  1017→    12000,
+  1018→    [
+  1019→      num("boxSize", "Box size for estimation", 128, { step: 16, min: 32, tab: "CTF" }),
+  1020→      num("focusRange", "Defocus search range", 3000, { unit: "Å", step: 500, tab: "CTF" }),
+  1021→      bool("doRegDef", "Defocus regularisation", false, { tab: "CTF", advanced: true }),
+  1022→    ],
+  1023→    "CTF refined for {n} tilt series",
+  1024→    "cmd",
+  1025→    {
+  1026→      category: "tomo",
+  1027→      group: "Tomography",
+  1028→      tabs: ["CTF", "Optimisation"],
+  1029→      inputs: [
+  1030→        inp("tiltseries", L.tiltIn, ["tiltseries"]),
+  1031→        inp("reference", "Reference 3D map", ["volume", "halfmap"]),
+  1032→      ],
+  1033→      outputs: [outp("tiltseries", "CTF-refined tilt-series STAR", "tiltseries")],
+  1034→    }
+  1035→  ),
+  1036→  spec(
+  1037→    "tomo_exclude",
+  1038→    "Tomo: Exclude Tilt Images",
+  1039→    "EyeOff",
+  1040→    "slate",
+  1041→    "Interactively exclude bad tilt images (Napari-based relion_python_tomo_exclude_tilt_images).",
+  1042→    3000,
+  1043→    [
+  1044→      num("cacheSize", "Cached tilt series", 5, { min: 1, max: 10, tab: "Others" }),
+  1045→      num("maxTilt", "Exclude above tilt", 60, { unit: "°", step: 5, tab: "Others" }),
+  1046→      num("minFrames", "Minimum frames kept", 1, { min: 1, max: 40, tab: "Others" }),
+  1047→    ],
+  1048→    "{n} tilt images excluded",
+  1049→    "cmd",
+  1050→    {
+  1051→      category: "tomo",
+  1052→      group: "Tomography",
+  1053→      tabs: ["Others"],
+  1054→      inputs: [inp("tiltseries", L.tiltIn, ["tiltseries"])],
+  1055→      outputs: [outp("tiltseries", "Filtered tilt-series STAR", "tiltseries")],
+  1056→    }
+  1057→  ),
+  1058→  spec(
+  1059→    "tomo_polish",
+  1060→    "Tomo: Polishing",
+  1061→    "Wand2",
+  1062→    "violet",
+  1063→    "Frame-series alignment / per-particle motion polishing (relion_tomo_align).",
+  1064→    16000,
+  1065→    [
+  1066→      num("boxSize", "Box size", 128, { step: 16, min: 32, tab: "Polish" }),
+  1067→      num("maxError", "Max alignment error", 5, { unit: "px", step: 1, tab: "Polish" }),
+  1068→      sel("motionMode", "Motion mode", "motion", ["motion", "shift_only"], { tab: "Polish" }),
+  1069→    ],
+  1070→    "Polished {n} particles",
+  1071→    "cmd",
+  1072→    {
+  1073→      category: "tomo",
+  1074→      group: "Tomography",
+  1075→      tabs: ["Polish"],
+  1076→      inputs: [
+  1077→        inp("tiltseries", L.tiltIn, ["tiltseries"]),
+  1078→        inp("particles", "Subtomogram particles", ["particles"]),
+  1079→      ],
+  1080→      outputs: [outp("tiltseries", "Polished tilt-series STAR", "tiltseries")],
+  1081→    }
+  1082→  ),
+  1083→  spec(
+  1084→    "tomo_reconstruct",
+  1085→    "Tomo: Reconstruct Subtomos",
+  1086→    "Layers",
+  1087→    "cyan",
+  1088→    "Reconstruct pseudo-subtomograms from aligned tilt series (relion_tomo_reconstruct_particle).",
+  1089→    18000,
+  1090→    [
+  1091→      num("boxSize", "Box size", 128, { step: 16, min: 32, tab: "Reconstruct" }),
+  1092→      num("binning", "Binning factor", 1, { step: 0.5, min: 0.5, max: 16, tab: "Reconstruct" }),
+  1093→      num("snr", "SNR", 0.001, { step: 0.001, min: 0.0001, tab: "Reconstruct", advanced: true }),
+  1094→    ],
+  1095→    "{n} subtomograms reconstructed",
+  1096→    "cmd",
+  1097→    {
+  1098→      category: "tomo",
+  1099→      group: "Tomography",
+  1100→      tabs: ["Reconstruct"],
+  1101→      inputs: [
+  1102→        inp("tiltseries", L.tiltIn, ["tiltseries"]),
+  1103→        inp("coords", "Particle picks / poses", ["coords", "particles"]),
+  1104→      ],
+  1105→      outputs: [outp("particles", "Subtomogram STAR (.star + .mrcs)", "particles")],
+  1106→    }
+  1107→  ),
+  1108→  spec(
+  1109→    "tomo_denoise",
+  1110→    "Tomo: Denoise",
+  1111→    "Brush",
+  1112→    "violet",
+  1113→    "Denoise tomograms with cryoCARE train/predict (external python environment).",
+  1114→    14000,
+  1115→    [
+  1116→      sel("mode", "Mode", "cryoCARE:train", ["cryoCARE:train", "cryoCARE:predict"], { tab: "Denoise" }),
+  1117→      num("subvolumeDimensions", "Sub-volume size", 72, { unit: "px", step: 8, min: 64, tab: "Denoise" }),
+  1118→      num("trainingSubvolumes", "Sub-volumes per tomo", 1200, { step: 100, min: 100, tab: "Denoise" }),
+  1119→    ],
+  1120→    "{n} tomograms denoised",
+  1121→    "external",
+  1122→    {
+  1123→      category: "tomo",
+  1124→      group: "Tomography",
+  1125→      tabs: ["Denoise"],
+  1126→      inputs: [inp("tomograms", L.tomoIn, ["tomograms"])],
+  1127→      outputs: [outp("tomograms", "Denoised tomograms STAR", "tomograms")],
+  1128→    }
+  1129→  ),
+  1130→  spec(
+  1131→    "tomo_picks",
+  1132→    "Tomo: Picking",
+  1133→    "Crosshair",
+  1134→    "rose",
+  1135→    "Pick particles/filaments on tomograms in Napari (relion_python_tomo_pick + get_particle_poses).",
+  1136→    8000,
+  1137→    [
+  1138→      sel("pickMode", "Pick mode", "particles", ["particles", "filaments", "surfaces", "spheres"], { tab: "Picking" }),
+  1139→      num("spacing", "Spacing", 20, { unit: "Å", step: 5, min: 5, tab: "Picking" }),
+  1140→      num("cacheSize", "Cached tilt series", 5, { min: 1, max: 10, tab: "Picking", advanced: true }),
+  1141→    ],
+  1142→    "{n} picks imported",
+  1143→    "external",
+  1144→    {
+  1145→      category: "tomo",
+  1146→      group: "Tomography",
+  1147→      tabs: ["Picking"],
+  1148→      inputs: [inp("tomograms", L.tomoIn, ["tomograms"])],
+  1149→      outputs: [outp("coords", "Picked positions (poses)", "coords")],
+  1150→    }
+  1151→  ),
+  1152→  spec(
+  1153→    "tomo_extract",
+  1154→    "Tomo: Extract Subtomos",
+  1155→    "Crop",
+  1156→    "orange",
+  1157→    "Extract pseudo-subtomogram boxes at picked positions (relion_tomo_subtomo).",
+  1158→    9000,
+  1159→    [
+  1160→      num("boxSize", "Box size", 128, { step: 16, min: 32, tab: "extract" }),
+  1161→      num("binning", "Binning factor", 1, { step: 0.5, min: 0.5, max: 16, tab: "extract" }),
+  1162→      num("maxDose", "Maximum dose", 60, { unit: "e⁻/Å²", step: 5, tab: "extract" }),
+  1163→    ],
+  1164→    "{n} subtomos extracted",
+  1165→    "cmd",
+  1166→    {
+  1167→      category: "tomo",
+  1168→      group: "Tomography",
+  1169→      tabs: ["extract"],
+  1170→      inputs: [
+  1171→        inp("tomograms", L.tomoIn, ["tomograms"]),
+  1172→        inp("coords", "Particle picks / poses", ["coords"]),
+  1173→      ],
+  1174→      outputs: [outp("particles", "Subtomogram particles STAR", "particles")],
+  1175→    }
+  1176→  ),
+  1177→
+  1178→  /* ------------------------------------------------------------------ */
+  1179→  /* External (shared)                                                   */
+  1180→  /* ------------------------------------------------------------------ */
+  1181→  spec(
+  1182→    "external",
+  1183→    "External (custom)",
+  1184→    "Terminal",
+  1185→    "slate",
+  1186→    "Run any external command line inside the pipeline, exporting RELION metadata as variables.",
+  1187→    5000,
+  1188→    [
+  1189→      sel("interpreter", "Interpreter", "bash", ["bash", "sh"], { tab: "Running" }),
+  1190→      num("timeout", "Timeout", 3600, { unit: "s", step: 60, min: 60, tab: "Running" }),
+  1191→      bool("exportMeta", "Export metadata", true, { tab: "Others", advanced: true }),
+  1192→    ],
+  1193→    "External command done",
+  1194→    "cmd",
+  1195→    {
+  1196→      category: "external",
+  1197→      tabs: ["Running", "Others"],
+  1198→      inputs: [inp("input", "Any input (optional)", ["*"], true)],
+  1199→      outputs: [outp("output", "External output", "star")],
+  1200→    }
+  1201→  ),
+  1202→];
+  1203→
+  1204→/** Ordered group labels for stats. */
+  1205→export const JOB_GROUPS: string[] = ["SPA", "Tomography"];
+  1206→
+  1207→const TYPE_MAP = new Map(JOB_TYPES.map((t) => [t.key, t]));
+  1208→
+  1209→export function jobType(key: string): JobTypeSpec | undefined {
+  1210→  return TYPE_MAP.get(key);
+  1211→}
+  1212→
+  1213→/** Default parameter map for a job type (used by seeding + forms). */
+  1214→export function defaultParams(key: string): Record<string, ParamValue> {
+  1215→  const t = jobType(key);
+  1216→  if (!t) return {};
+  1217→  const out: Record<string, ParamValue> = {};
+  1218→  for (const p of t.params) out[p.key] = p.default;
+  1219→  return out;
+  1220→}
+  1221→
+  1222→/** All tabs declared by the spec + any param tabs, in order, deduped. */
+  1223→export function tabsFor(t: JobTypeSpec | undefined): string[] {
+  1224→  if (!t) return [];
+  1225→  const tabs: string[] = [];
+  1226→  for (const name of [...t.tabs, ...t.params.map((p) => p.tab ?? "")]) {
+  1227→    if (name && !tabs.includes(name)) tabs.push(name);
+  1228→  }
+  1229→  return tabs.length > 0 ? tabs : ["Parameters"];
+  1230→}
+  1231→
+  1232→/* ------------------------------------------------------------------ */
+  1233→/* Port helpers                                                        */
+  1234→/* ------------------------------------------------------------------ */
+  1235→
+  1236→/** Y coordinate of the i-th port (of count) on a card edge. */
+  1237→export function portY(i: number, count: number): number {
+  1238→  if (count <= 1) return CARD_H / 2;
+  1239→  return (CARD_H * (i + 1)) / (count + 1);
+  1240→}
+  1241→
+  1242→/** Can the output port of one job type feed the input port of another? */
+  1243→export function portsCompatible(
+  1244→  fromType: string,
+  1245→  fromPort: string,
+  1246→  toType: string,
+  1247→  toPort: string
+  1248→): boolean {
+  1249→  const from = jobType(fromType);
+  1250→  const to = jobType(toType);
+  1251→  const o = from?.outputs.find((p) => p.name === fromPort);
+  1252→  const i = to?.inputs.find((p) => p.name === toPort);
+  1253→  if (!o || !i) return false;
+  1254→  const accepts = i.accepts ?? ["*"];
+  1255→  return accepts.includes("*") || (o.kind != null && accepts.includes(o.kind));
+  1256→}
+  1257→
+  1258→/**
+  1259→ * Default (first compatible) output→input port pair between two job types.
+  1260→ * Used to give legacy DB edges a sensible port mapping.
+  1261→ */
+  1262→export function defaultPorts(
+  1263→  fromType: string,
+  1264→  toType: string
+  1265→): { fromPort?: string; toPort?: string } {
+  1266→  const from = jobType(fromType);
+  1267→  const to = jobType(toType);
+  1268→  if (!from || !to) return {};
+  1269→  for (const o of from.outputs) {
+  1270→    for (const i of to.inputs) {
+  1271→      const accepts = i.accepts ?? ["*"];
+  1272→      if (accepts.includes("*") || (o.kind != null && accepts.includes(o.kind))) {
+  1273→        return { fromPort: o.name, toPort: i.name };
+  1274→      }
+  1275→    }
+  1276→  }
+  1277→  return {
+  1278→    fromPort: from.outputs[0]?.name,
+  1279→    toPort: to.inputs[0]?.name,
+  1280→  };
+  1281→}
+  1282→
+  1283→/* ------------------------------------------------------------------ */
+  1284→/* Legacy param coercion                                               */
+  1285→/* ------------------------------------------------------------------ */
+  1286→
+  1287→/**
+  1288→ * Coerce a stored raw value into the schema-typed value. Handles legacy
+  1289→ * "true"/"false" strings for bool params and stringified numbers.
+  1290→ */
+  1291→export function coerceParam(p: ParamSchema, raw: unknown): ParamValue {
+  1292→  if (p.type === "bool") {
+  1293→    if (typeof raw === "boolean") return raw;
+  1294→    if (raw === "true") return true;
+  1295→    return p.default;
+  1296→  }
+  1297→  if (p.type === "path" || p.type === "text") {
+  1298→    if (typeof raw === "string") return raw;
+  1299→    return p.default;
+  1300→  }
+  1301→  if (p.type === "number") {
+  1302→    const n = typeof raw === "number" ? raw : parseFloat(String(raw ?? ""));
+  1303→    return Number.isFinite(n) ? n : p.default;
+  1304→  }
+  1305→  if (typeof raw === "string" && p.options?.includes(raw)) return raw;
+  1306→  return p.default;
+  1307→}
+  1308→
+  1309→/** spec defaults overlaid with stored params (coerced). */
+  1310→export function mergedParams(
+  1311→  typeKey: string,
+  1312→  stored: Record<string, ParamValue> | null | undefined
+  1313→): Record<string, ParamValue> {
+  1314→  const t = jobType(typeKey);
+  1315→  const out: Record<string, ParamValue> = {};
+  1316→  for (const p of t?.params ?? []) {
+  1317→    out[p.key] = coerceParam(p, stored?.[p.key]);
+  1318→  }
+  1319→  return out;
+  1320→}
+  1321→
