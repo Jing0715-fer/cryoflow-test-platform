@@ -29,7 +29,10 @@ const KPI_DEFS = [
 export function Hero({ report, isFetching }: { report: TestReport; isFetching: boolean }) {
   const { stats, raw, updatedAtLabel } = report;
   const env = raw.meta?.environment ?? {};
-  const done = stats.passed + stats.failed;
+  // every non-pending/non-running record counts as executed — includes the
+  // honest-failure reclassifications (sequential-limit, known-gap) which are
+  // TESTED outcomes, not unfinished work
+  const done = stats.total - stats.pending - stats.running;
   const progressPct = stats.total > 0 ? (done / stats.total) * 100 : 0;
   const running = stats.pending > 0;
 

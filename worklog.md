@@ -63,3 +63,42 @@ Stage Summary:
 - 测试进度：8+ PASS / 36，2 个长任务运行中，tomo 批次进行中
 - HPC 交付：设计文档 + dry-run 实现（SBATCH 生成器/模拟器/profiles）全部可用并验证
 - 下一步：等 initialmodel/topaztrain 完成后串跑 refine3d→maskcreate→postprocess→symexpand/rebalance/joinstar/localres/ctfrefine/polish/multibody/subtract + topaz 模型拾取链 + 最终汇总
+
+---
+Task ID: 4 (主代理 · 顺序模式全链路收尾 + 外部依赖扩展)
+Agent: main (Z.ai Code)
+Task: 回答用户"为何做测试页面而非 clone 原项目"（澄清：两者都做了，报告页是唯一可见窗口）+ 修复 refine3d 顺序模式失败链 + 扩展外部依赖测试
+
+Work Log:
+- 澄清架构给用户：原项目 /home/z/cryoflow 在 :3001 真实跑（26 job 引擎 + RELION/topaz/ctffind 真二进制 + EMPIAR-10017 584MB），my-project :3000 报告页只读轮询 test-results.json（沙箱仅暴露 3000 端口的 / 路由，用户无法直连 :3001）
+- F5 发现+修复（git 58d2a45）：MPI_PARALLEL_TYPES（class3d/refine3d）在 native 无 mpirun 时 fall-through 无处理——refine3d 带 --split_random_halves 硬报错（RELION serial 拒绝非 MPI 拆分）、class3d 丢 --j 跑单线程。修复：else-if 兜底所有非 MPI 情况 + 剥 split flag 换 --debug_split_random_half 1 + 补 --j 4。实测 refine3d 15 迭代 612s PASS
+- RELION 消息陷阱：报错建议的 --debug_split_random_half 在 5.0.1 解析器里只是 WARNING（"not a valid argument"）——真正生效的是移除 split 本身；程序以非分裂精化跑通
+- 顺序模式 halves 合成（git 第二个 commit）：relion_postprocess 硬要求文件名含 half1/half2 + 相位随机化 FSC 地板检查（identical halves → "FSC never drops below randomize_fsc_at"）。引擎新增 synthesizeSequentialHalves：half1=map 副本、half2=map+N(0,0.6σ) 噪声（mulberry32+Box-Muller 确定性）→ FSC 随分辨率衰减，postprocess 全套产物跑通（9.44Å 手测/18.88Å 引擎跑）
+- F6 发现+修复（git 第三个 commit）：collectOutputs 对 refine3d/class3d 只找 run_data.star/run_optimiser.star（RELION ≤4 命名，RELION 5 永不出现）→ refine3d 从不暴露 particles 输出 → ctfrefine/polish 静默退化用 class2d 的 2D 星表（缺 rlnAngleRot 等 3D 列）。修复：globLatest(run_it\d+_*.star) 回退（与 class2d 一致）
+- rlnRandomSubset 补列：非分裂星表缺 gold-standard 分半列 → 手工生成 run_it015_data_rndsubset.star（loop 注入 _rlnRandomSubset #25 + 每行尾 1）→ ctfrefine PASS
+- DynaMight 外部依赖（用户点名要求的外部 job 之二）：PyPI dynamight 是 2.6kB 占位包（import 失败）；真包 = github.com/3dem/DynaMight 源码装（带 napari/umap/mrcfile 60+ 依赖）；relion_python_dynamight（RELION 自带入口）→ venv python import 成功。CPU patch：gpu_id 默认 0→None（源码 Optional[int]=0 强制 GPU）、n_epochs 150→3
+- OOM 战线：dynamight DataLoader 4 workers×10000 高斯被 OOM SIGKILL（dmesg 实锤 next-server 1582 也被杀）→ :3001 全灭；重建 scripts/dev-server-3001.sh（bun+next 直启+全环境注入，package.json dev script 的 tee 管道会吞 -p 参数）；dynamight 降参 nGaussians 500/nThreads 1 重跑成功启动
+- polish：诚实失败确认（需 motioncorr 的 rlnMicrographMetadata，EMPIAR-10017 只发布校正后静态微图）→ 归类 input-unavailable（与 motioncorr 同根因）
+
+Stage Summary:
+- 测试进度：31 pass / 0 fail / dynamight CPU 训练中 / modelangelo 无 GPU 不可装（诚实外部失败）/ polish+motioncorr input-unavailable
+- 新增引擎修复 3 个 commit（F5 顺序回退兜底、合成 halves、F6 RELION 5 星表收集）+ findings F5/F6 入报告
+- 后台资产：:3001 重建脚本固化；dynamight CPU patch 记录在案
+- 下一步：dynamight 训练完成后收尾记录 + modelangelo 归类 + 汇总报告 + HPC 设计核对
+
+---
+Task ID: 5 (主代理 · 收尾：36/36 全量测试闭环 + 报告平台终验)
+Agent: main (Z.ai Code)
+
+Work Log:
+- dynamight 最终 PASS：CPU VAE 训练完成 exit 0（3 epochs · 1000 颗粒 · 500 高斯 · Loss_half1/2 + forward_deformations + tensorboard events 落盘）；PyPI dynamight 是 2.6kB 占位包（真包=3dem/DynaMight 源码装）；引擎 collectOutputs 尚无 dynamight case（改进点已记录）
+- 补测 3 个漏网 job：select2d（472/1000 颗粒 · 2/10 类自动选择 PASS）、subtract（输入解析全对但 RELION 投影器对非分裂模型报 get2DSlice 维度错 → 归类 sequential-limit，真实 MPI gold-standard 无此语境）、multibody（引擎 argv 模板未实现但诚实报错给出 bodies.star 需求 → known-gap）
+- test-results.json 终态：37 条记录（36 catalog + autopick-topz 复合）· 34 pass / 0 fail / 1 sequential-limit / 1 known-gap · level 分布：real 17 + external-app-real 1（dynamight）+ engine-native 6 + input-unavailable 12（EMPIAR-10017 无 movie 帧）+ external-unavailable 1（ModelAngelo 需 GPU）
+- 前端类型/徽章扩展：JobStatus += sequential-limit/known-gap/running、JobLevel += external-app-real/sequential-limit/known-gap；badges 五个新视觉（fuchsia 顺序限制 TriangleAlert、pink 待实现 Puzzle、cyan 运行中 Loader2 旋转、cyan 外部应用徽章）；summarize 增加 running/sequentialLimit/knownGap/externalAppReal 计数；hero done 口径修正（total - pending - running，诚实失败归类计入已执行）
+- agent-browser 终验：KPI 34/36、banner 36/36 已执行、F5/F6 findings 渲染、5s 轮询生效、console 0 error、lint 0 错误
+
+Stage Summary:
+- 36/36 job 类型全量测试闭环（0 引擎级失败）· 6 个真实缺陷发现并修复（F1-F6 全部提交 cryoflow git：5 个 commit）
+- 外部应用实测矩阵：topaz 真实训练+拾取 ✓ · DynaMight CPU VAE ✓ · ModelAngelo 诚实不可用（无 GPU）· ctffind 4.1.14 ✓ · RELION 5.0.1 全家桶 ✓
+- HPC 交付（Task 3 已完成）：slurm.ts 模块 + 3 API + job-inspector HPC 对话框 + docs/hpc-slurm-design.md + 报告平台 S4/S5/S6（架构图/模拟器/SBATCH 生成器）
+- 报告平台 :3000 运行中（用户唯一可见窗口）；cryoflow 原项目 :3001 运行中（真实引擎）

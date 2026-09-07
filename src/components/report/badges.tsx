@@ -3,7 +3,7 @@
 import { cn } from "@/lib/utils";
 import { CATEGORY_TONE, LEVEL_LABEL } from "@/lib/job-catalog";
 import type { JobLevel, JobStatus } from "@/lib/types";
-import { CheckCircle2, XCircle, CircleDashed } from "lucide-react";
+import { CheckCircle2, XCircle, CircleDashed, TriangleAlert, Puzzle, Loader2 } from "lucide-react";
 
 export function CategoryBadge({ category, className }: { category: string; className?: string }) {
   const tone = CATEGORY_TONE[category] ?? CATEGORY_TONE["External"];
@@ -25,10 +25,16 @@ export function LevelBadge({ level }: { level: JobLevel }) {
     real: "border-teal-300/70 bg-teal-50 text-teal-700 dark:border-teal-700/60 dark:bg-teal-950/50 dark:text-teal-300",
     "engine-native":
       "border-violet-300/70 bg-violet-50 text-violet-700 dark:border-violet-700/60 dark:bg-violet-950/50 dark:text-violet-300",
+    "external-app-real":
+      "border-cyan-300/70 bg-cyan-50 text-cyan-700 dark:border-cyan-700/60 dark:bg-cyan-950/50 dark:text-cyan-300",
     "external-unavailable":
       "border-amber-300/70 bg-amber-50 text-amber-700 dark:border-amber-700/60 dark:bg-amber-950/50 dark:text-amber-300",
     "input-unavailable":
       "border-orange-300/70 bg-orange-50 text-orange-700 dark:border-orange-700/60 dark:bg-orange-950/50 dark:text-orange-300",
+    "sequential-limit":
+      "border-fuchsia-300/70 bg-fuchsia-50 text-fuchsia-700 dark:border-fuchsia-700/60 dark:bg-fuchsia-950/50 dark:text-fuchsia-300",
+    "known-gap":
+      "border-pink-300/70 bg-pink-50 text-pink-700 dark:border-pink-700/60 dark:bg-pink-950/50 dark:text-pink-300",
     pending: "border-slate-300/70 bg-slate-100 text-slate-500 dark:border-slate-700/60 dark:bg-slate-800/60 dark:text-slate-400",
   };
   return (
@@ -58,6 +64,30 @@ export function StatusBadge({ status, compact = false }: { status: JobStatus; co
       <span className="inline-flex items-center gap-1 rounded-md border border-rose-300/70 bg-rose-50 px-1.5 py-0.5 text-[10px] font-semibold text-rose-700 dark:border-rose-700/60 dark:bg-rose-950/50 dark:text-rose-300">
         <XCircle className="h-3 w-3" aria-hidden />
         {compact ? "FAIL" : "失败"}
+      </span>
+    );
+  }
+  if (status === "sequential-limit") {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-md border border-fuchsia-300/70 bg-fuchsia-50 px-1.5 py-0.5 text-[10px] font-semibold text-fuchsia-700 dark:border-fuchsia-700/60 dark:bg-fuchsia-950/50 dark:text-fuchsia-300">
+        <TriangleAlert className="h-3 w-3" aria-hidden />
+        {compact ? "SEQ-LIMIT" : "顺序模式限制"}
+      </span>
+    );
+  }
+  if (status === "known-gap") {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-md border border-pink-300/70 bg-pink-50 px-1.5 py-0.5 text-[10px] font-semibold text-pink-700 dark:border-pink-700/60 dark:bg-pink-950/50 dark:text-pink-300">
+        <Puzzle className="h-3 w-3" aria-hidden />
+        {compact ? "GAP" : "待实现"}
+      </span>
+    );
+  }
+  if (status === "running") {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-md border border-cyan-300/70 bg-cyan-50 px-1.5 py-0.5 text-[10px] font-semibold text-cyan-700 dark:border-cyan-700/60 dark:bg-cyan-950/50 dark:text-cyan-300">
+        <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
+        {compact ? "RUNNING" : "运行中"}
       </span>
     );
   }

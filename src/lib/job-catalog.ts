@@ -86,8 +86,11 @@ export const CATEGORY_TONE: Record<string, string> = {
 export const LEVEL_LABEL: Record<JobLevel, string> = {
   real: "真实 RELION 执行",
   "engine-native": "引擎原生实现",
+  "external-app-real": "外部应用真实跑通",
   "external-unavailable": "外部依赖不可用",
   "input-unavailable": "输入数据不含此类型",
+  "sequential-limit": "顺序模式限制",
+  "known-gap": "引擎待实现（诚实报错）",
   pending: "等待执行",
 };
 
@@ -124,9 +127,26 @@ export function summarize(jobs: MergedJob[]) {
   const passed = jobs.filter((j) => j.status === "pass").length;
   const failed = jobs.filter((j) => j.status === "fail").length;
   const pending = jobs.filter((j) => j.status === "pending").length;
+  const running = jobs.filter((j) => j.status === "running").length;
+  const sequentialLimit = jobs.filter((j) => j.status === "sequential-limit").length;
+  const knownGap = jobs.filter((j) => j.status === "known-gap").length;
   const real = jobs.filter((j) => j.level === "real").length;
   const engineNative = jobs.filter((j) => j.level === "engine-native").length;
+  const externalAppReal = jobs.filter((j) => j.level === "external-app-real").length;
   const external = jobs.filter((j) => j.level === "external-unavailable").length;
   const totalSec = jobs.reduce((acc, j) => acc + (j.durationSec ?? 0), 0);
-  return { total: jobs.length, passed, failed, pending, real, engineNative, external, totalSec };
+  return {
+    total: jobs.length,
+    passed,
+    failed,
+    pending,
+    running,
+    sequentialLimit,
+    knownGap,
+    real,
+    engineNative,
+    externalAppReal,
+    external,
+    totalSec,
+  };
 }

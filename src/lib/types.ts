@@ -1,7 +1,21 @@
 // Shared data contracts for the CryoFlow test report & HPC platform.
 
-export type JobLevel = "real" | "engine-native" | "external-unavailable" | "input-unavailable" | "pending";
-export type JobStatus = "pass" | "fail" | "pending";
+export type JobLevel =
+  | "real"
+  | "engine-native"
+  | "external-app-real"
+  | "external-unavailable"
+  | "input-unavailable"
+  | "sequential-limit"
+  | "known-gap"
+  | "pending";
+export type JobStatus =
+  | "pass"
+  | "fail"
+  | "pending"
+  | "sequential-limit"
+  | "known-gap"
+  | "running";
 
 export interface TestJob {
   key: string;
