@@ -1,0 +1,113 @@
+import type { SimJob } from "@/lib/types";
+
+// EMPIAR-10017 full-pipeline workflow submitted to the Slurm simulator.
+// Dependencies model the hashtuple the real dispatcher would pass to
+// sbatch --dependency=afterok:…
+export const WORKFLOW_JOBS: (SimJob & { color: string; arrayCountFixed?: number })[] = [
+  {
+    key: "import",
+    name: "import",
+    category: "Import",
+    gpus: 0,
+    durationMin: 1,
+    deps: [],
+    timeLimitMin: 10,
+    color: "bg-teal-500/80 border-teal-600/40",
+  },
+  {
+    key: "motioncorr",
+    name: "motioncorr",
+    category: "Motion",
+    gpus: 1,
+    durationMin: 3,
+    deps: ["import"],
+    arrayCount: 10,
+    timeLimitMin: 30,
+    color: "bg-cyan-500/80 border-cyan-600/40",
+  },
+  {
+    key: "ctffind",
+    name: "ctffind",
+    category: "CTF",
+    gpus: 0,
+    durationMin: 1.5,
+    deps: ["motioncorr"],
+    arrayCount: 10,
+    timeLimitMin: 20,
+    color: "bg-emerald-500/80 border-emerald-600/40",
+  },
+  {
+    key: "topaztrain",
+    name: "topaz train",
+    category: "Picking",
+    gpus: 1,
+    durationMin: 30,
+    deps: ["import"],
+    timeLimitMin: 60,
+    color: "bg-violet-500/80 border-violet-600/40",
+  },
+  {
+    key: "autopick",
+    name: "autopick",
+    category: "Picking",
+    gpus: 1,
+    durationMin: 5,
+    deps: ["ctffind", "topaztrain"],
+    timeLimitMin: 30,
+    color: "bg-fuchsia-500/80 border-fuchsia-600/40",
+  },
+  {
+    key: "extract",
+    name: "extract",
+    category: "Extraction",
+    gpus: 0,
+    durationMin: 2,
+    deps: ["autopick"],
+    timeLimitMin: 20,
+    color: "bg-orange-500/80 border-orange-600/40",
+  },
+  {
+    key: "class2d",
+    name: "class2d",
+    category: "Classification",
+    gpus: 2,
+    durationMin: 20,
+    deps: ["extract"],
+    timeLimitMin: 120,
+    color: "bg-pink-500/80 border-pink-600/40",
+  },
+  {
+    key: "class3d",
+    name: "class3d",
+    category: "Classification",
+    gpus: 4,
+    durationMin: 30,
+    deps: ["class2d"],
+    timeLimitMin: 240,
+    color: "bg-rose-500/80 border-rose-600/40",
+  },
+  {
+    key: "refine3d",
+    name: "refine3d",
+    category: "Refinement",
+    gpus: 4,
+    durationMin: 45,
+    deps: ["class3d"],
+    timeLimitMin: 240,
+    color: "bg-red-500/80 border-red-600/40",
+  },
+  {
+    key: "postprocess",
+    name: "postprocess",
+    category: "Postprocess",
+    gpus: 0,
+    durationMin: 1,
+    deps: ["refine3d"],
+    timeLimitMin: 20,
+    color: "bg-amber-500/80 border-amber-600/40",
+  },
+];
+
+export function workflowColorOf(key: string): string {
+  return WORKFLOW_JOBS.find((j) => j.key === key)?.color ?? "bg-slate-500/80 border-slate-600/40";
+}
