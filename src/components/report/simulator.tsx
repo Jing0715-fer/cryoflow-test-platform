@@ -15,6 +15,7 @@ import {
   Cpu,
   Gpu,
   Layers2,
+  GitCompare,
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -53,6 +54,8 @@ export function SlurmSimulator() {
   });
   const [enabled, setEnabled] = useState<Set<string>>(() => new Set(WORKFLOW_JOBS.map((j) => j.key)));
   const [backfill, setBackfill] = useState(true);
+  const [ab, setAb] = useState<{ on: SimulateResponse; off: SimulateResponse } | null>(null);
+  const [abRunning, setAbRunning] = useState(false);
   const [result, setResult] = useState<SimulateResponse | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [clock, setClock] = useState(0);
@@ -153,6 +156,49 @@ export function SlurmSimulator() {
       toast({ title: "网络错误", description: "无法连接 /api/hpc/simulate", variant: "destructive" });
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  // ---- A/B comparison: same config, backfill OFF vs ON ------------------------
+  const runAB = async () => {
+    setAbRunning(true);
+    try {
+      const jobs = WORKFLOW_JOBS.filter((j) => enabled.has(j.key)).map(({ color: _c, ...rest }) => rest);
+      const base = { cluster: { ...cluster, defaultTimeMin: Math.max(cluster.defaultTimeMin, 10) }, jobs };
+      const [offRes, onRes] = await Promise.all([
+        fetch("/api/hpc/simulate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...base, backfill: false }),
+        }),
+        fetch("/api/hpc/simulate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...base, backfill: true }),
+        }),
+      ]);
+      const off = await offRes.json();
+      const on = await onRes.json();
+      if (!offRes.ok || !onRes.ok) {
+        toast({ title: "A/B 对比失败", description: off?.error ?? on?.error ?? `HTTP ${offRes.status}`, variant: "destructive" });
+        return;
+      }
+      setAb({ off, on });
+      // keep the main visualization on the backfill-ON run
+      setResult(on as SimulateResponse);
+      setSelected(null);
+      setClock(0);
+      setPlaying(true);
+      const dOn = on.stats;
+      const dOff = off.stats;
+      toast({
+        title: "A/B 对比完成（双跑）",
+        description: `makespan ${dOff.makespanMin}′ → ${dOn.makespanMin}′ · 排队等待 ${dOff.avgQueueWaitMin}′ → ${dOn.avgQueueWaitMin}′ · 回填 ${dOn.backfilledJobs} 次`,
+      });
+    } catch {
+      toast({ title: "网络错误", description: "A/B 双跑请求失败", variant: "destructive" });
+    } finally {
+      setAbRunning(false);
     }
   };
 
@@ -319,10 +365,20 @@ export function SlurmSimulator() {
               className="h-11 w-full gap-2"
               size="lg"
               onClick={submit}
-              disabled={submitting || enabled.size === 0}
+              disabled={submitting || abRunning || enabled.size === 0}
             >
               <Zap className="h-4 w-4" aria-hidden />
               {submitting ? "调度计算中…" : `Submit Workflow（${enabled.size} 作业）`}
+            </Button>
+            <Button
+              variant="outline"
+              className="h-11 w-full gap-2"
+              size="lg"
+              onClick={runAB}
+              disabled={submitting || abRunning || enabled.size === 0}
+            >
+              <GitCompare className="h-4 w-4" aria-hidden />
+              {abRunning ? "A/B 双跑中…" : "A/B 对比（FIFO vs Backfill）"}
             </Button>
           </CardContent>
         </Card>
@@ -405,6 +461,9 @@ export function SlurmSimulator() {
           </Card>
         ) : (
           <>
+            {/* A/B comparison snapshot */}
+            {ab && <AbCompareCard off={ab.off} on={ab.on} />}
+
             {/* stats */}
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-6">
               <StatCell icon={Timer} label="makespan" value={`${result.stats.makespanMin} min`} tone="text-primary" />
@@ -783,5 +842,110 @@ function StatCell({
       <p className={cn("mt-1 truncate font-mono text-sm font-bold tabular-nums", tone)}>{value}</p>
       {sub && <p className="mt-0.5 truncate text-[10px] tabular-nums text-muted-foreground">{sub}</p>}
     </Card>
+  );
+}
+
+function AbCompareCard({ off, on }: { off: SimulateResponse; on: SimulateResponse }) {
+  const rows: { label: string; off: number; on: number; fmt: (v: number) => string; better: "lower" | "higher" }[] = [
+    {
+      label: "makespan",
+      off: off.stats.makespanMin,
+      on: on.stats.makespanMin,
+      fmt: (v) => `${v} min`,
+      better: "lower",
+    },
+    {
+      label: "平均排队等待",
+      off: off.stats.avgQueueWaitMin,
+      on: on.stats.avgQueueWaitMin,
+      fmt: (v) => `${v} min`,
+      better: "lower",
+    },
+    {
+      label: "GPU 利用率",
+      off: off.stats.gpuUtilization * 100,
+      on: on.stats.gpuUtilization * 100,
+      fmt: (v) => `${v.toFixed(1)}%`,
+      better: "higher",
+    },
+    {
+      label: "backfill 回填次数",
+      off: off.stats.backfilledJobs,
+      on: on.stats.backfilledJobs,
+      fmt: (v) => `${v} 次`,
+      better: "higher",
+    },
+  ];
+  const makespanTie = off.stats.makespanMin === on.stats.makespanMin;
+  return (
+    <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.35 }}>
+      <Card className="border-primary/25 bg-primary/[0.04]">
+        <CardHeader className="p-4 pb-2">
+          <CardTitle className="flex flex-wrap items-center gap-2 text-sm">
+            <GitCompare className="h-4 w-4 text-primary" aria-hidden /> A/B 对比 · 严格 FIFO vs EASY Backfill
+            <Badge variant="outline" className="font-mono text-[10px] font-normal text-muted-foreground">
+              同配置双跑快照
+            </Badge>
+          </CardTitle>
+          <CardDescription className="text-xs">
+            {makespanTie
+              ? "makespan 持平（关键路径不受碎片影响）——收益体现在排队等待与碎片利用率，GPU 作业越密集差异越大。"
+              : "backfill 收紧了时间轴：更短的 makespan 来自对 GPU 空闲碎片的填充。"}
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="p-4 pt-1">
+          <div className="overflow-hidden rounded-lg border">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="border-b bg-muted/50">
+                  <th scope="col" className="p-2 text-left font-medium text-muted-foreground">指标</th>
+                  <th scope="col" className="p-2 text-right font-medium text-muted-foreground">严格 FIFO</th>
+                  <th scope="col" className="p-2 text-right font-medium text-muted-foreground">EASY Backfill</th>
+                  <th scope="col" className="p-2 text-right font-medium text-muted-foreground">Δ</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((r) => {
+                  const onWins =
+                    r.better === "lower" ? r.on < r.off : r.on > r.off;
+                  const delta = r.on - r.off;
+                  const deltaTxt =
+                    r.label === "backfill 回填次数"
+                      ? delta === 0
+                        ? "—"
+                        : `+${delta}`
+                      : `${delta > 0 ? "+" : ""}${r.label === "GPU 利用率" ? delta.toFixed(1) : delta.toFixed(1)}${r.label.includes("等待") || r.label === "makespan" ? " min" : "%"}`;
+                  return (
+                    <tr key={r.label} className="border-b last:border-0">
+                      <td className="p-2 font-medium">{r.label}</td>
+                      <td className="p-2 text-right font-mono tabular-nums text-muted-foreground">{r.fmt(r.off)}</td>
+                      <td
+                        className={cn(
+                          "p-2 text-right font-mono font-semibold tabular-nums",
+                          onWins ? "text-primary" : "text-foreground"
+                        )}
+                      >
+                        {r.fmt(r.on)}
+                      </td>
+                      <td
+                        className={cn(
+                          "p-2 text-right font-mono tabular-nums",
+                          onWins ? "text-primary font-semibold" : "text-muted-foreground"
+                        )}
+                      >
+                        {onWins ? deltaTxt : delta === 0 ? "—" : deltaTxt}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <p className="mt-2 text-[11px] leading-relaxed text-muted-foreground">
+            主可视化（Gantt/事件流）展示 Backfill-ON 侧；调度语义差异见下方映射卡与事件流中的 RESERVED / BACKFILL 事件。
+          </p>
+        </CardContent>
+      </Card>
+    </motion.div>
   );
 }
