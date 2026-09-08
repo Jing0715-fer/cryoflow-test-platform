@@ -122,3 +122,26 @@ Stage Summary:
   ② https://github.com/Jing0715-fer/cryoflow-test-platform @733f092（测试报告平台，含 README）
 - token 仅在推送命令中一次性使用，未持久化到任何 .git/config 或文件
 - 风险提示：PAT 已在对话中明文出现，建议用户用完后在 GitHub Settings→Developer settings→Tokens 撤销轮换
+
+---
+Task ID: 7 (cron QA 轮次 · 引擎实况 + 耗时分析)
+Agent: main (Z.ai Code)
+Task: 15 分钟自检轮次：QA 平台健康 → 新功能开发（引擎实时状态 + 耗时分析）→ 移动端溢出修复 → push
+
+Work Log:
+- 基线 QA：dev server :3000/:3001 双在线、日志无错误、数据 37 条（35 pass/1 sequential-limit/1 known-gap）、6 section 全渲染、console/page errors = 0 → 判定稳定，进入新功能开发
+- 新功能 A 引擎实时状态：/api/engine-status（服务端探测 :3001 /api/system + /api/projects，AbortController 2.5s 超时，离线优雅降级不报 5xx）+ useEngineStatus hook（5s 轮询）+ EngineStatusStrip（hero 区心跳条：在线脉冲灯、RELION 5.0.1 native 徽章+路径 tooltip、引擎侧 2 项目/3 job 计数徽章、项目名 chip）
+- 新功能 B 耗时分析 S2.6：WalltimeSection（37→36 目录条目全量 wall-time 对数刻度横条图 log₁₀(1+sec)、等级配色对齐徽章体系、4 过滤 chip 全部/仅真实执行/SPA/Tomo 实测切换 36↔17、4 KPI 卡（总 2h21m/真实执行/最长 topaztrain 8485s/中位）、topaz 占比洞察卡衔接 HPC GPU 论据、tooltip 展示命令、framer 入场动画）
+- QA 发现并修复移动端横向溢出：390px 视口 scrollWidth=428（超 38px）——定位链：主容器溢出→topaz 区网格轨道 412px→卡内 ASCII 训练日志 pre；随 5s 轮询重渲染波动复现（transient min-content 抖动，@container 卡片）。标准修复：topaz-section 全部网格 Card/CardHeader/CardContent + grid 加 min-w-0；修复后跨轮询周期采样 390 稳定
+- 导航加"耗时分析"锚点（desktop+mobile）
+- lint 0 错误、console 0 错误、agent-browser 全验证（引擎条/条形图 36 条/过滤切换/移动端无横向滚动）
+- git commit dc3f4a8 + push 到 Jing0715-fer/cryoflow-test-platform
+
+Stage Summary:
+- 平台 8 个区块（原 6 + 引擎心跳条 + 耗时分析）全部在线可用，报告页从"静态报告"进化为"双系统实况面板"（:3000 报告 + :3001 引擎心跳互通）
+- 移动端 428→390 溢出修复（根因：网格项 min-width:auto + @container 卡片 min-content 抖动）
+- 仓库已同步 dc3f4a8
+
+未解决/风险：
+- 引擎侧 EMPIAR 项目 stats 显示 completed=0（引擎统计口径为 workflow 状态而非 REST harness 直接驱动的 job 记录）——心跳条已如实展示引擎侧计数，与报告页 36 job 是两套口径，暂不强行对齐
+- 下一轮候选：①SBATCH 生成器支持从耗时分析一键带入真实 durationSec 作 time limit 预估 ②findings 卡片增加 git show 链接 ③模拟器增加 backfill 策略开关 ④导出报告包含新两区块
