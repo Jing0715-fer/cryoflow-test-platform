@@ -145,3 +145,28 @@ Stage Summary:
 未解决/风险：
 - 引擎侧 EMPIAR 项目 stats 显示 completed=0（引擎统计口径为 workflow 状态而非 REST harness 直接驱动的 job 记录）——心跳条已如实展示引擎侧计数，与报告页 36 job 是两套口径，暂不强行对齐
 - 下一轮候选：①SBATCH 生成器支持从耗时分析一键带入真实 durationSec 作 time limit 预估 ②findings 卡片增加 git show 链接 ③模拟器增加 backfill 策略开关 ④导出报告包含新两区块
+
+---
+Task ID: 8 (cron QA 轮次 · backfill 调度 + SBATCH 测速锚点)
+Agent: main (Z.ai Code)
+Task: 15 分钟自检轮次：QA 稳定 → EASY backfill 调度策略 + SBATCH 真实测速时限预估 → 移动端修复 → push
+
+Work Log:
+- 基线 QA：双 server 在线、0 错误、7 section 全渲染 → 稳定，按 worklog 候选清单开发（选 ③backfill + ①测速时限）
+- EASY backfill：simulator.ts 重写调度核心——严格 FIFO（队首资源阻塞整条 GPU 队）↔ EASY 回填（候补作业须装入当前空闲 GPU 且先于队首 RESERVED 预约点完成，绝不推迟队首）；computeReservation 保守预约（按运行中作业完成序批量释放模拟）；新事件类型 RESERVED(amber)/BACKFILL(cyan)；route zod 加 backfill 布尔；UI 开关+统计 chip+语义卡映射
+- API 单元验证（玩具场景 A 6GPU/20min + B 6GPU/10min + C 2GPU/5min @ 1×8）：ON 时 C t=0 回填且 B 仍 20′ 启动（安全保证成立）；OFF 时 C 严格排队到 20′
+- 工作流扩展 10→17 job（class2d A/B 双胞胎、dynamight 拾取竞速、initialmodel 短作业、polish-b 变体、ctfrefine/localres 收尾）——默认 1×4 集群下制造教科书回填时刻（backfilled=1、avgWait 1.5→1.3）；默认集群 2×4→1×4
+- SBATCH 测速锚点：sbatch.ts 新增 estimateTimeLimit + MEASURED_KEY 映射 + 速度比模型（topaztrain ÷25× A100/CPU torch、RELION 类 ÷4× MPI、ctffind ÷1.2×、motioncorr 诚实无测量注记）；route 读 db/test-results.json 注入 estimate；EstimateCallout UI（沙箱实测 2h21m → ÷25× → 建议 10min → 一键应用滑杆 60→10 实测生效）
+- 排障两则：①Turbopack HMR 陈旧 chunk 报 Layers2 is not defined（源码+lint 正常、全新会话 0 错误=缓存残留，自愈）②移动端 652px 横向溢出（模拟器网格项 min-width:auto 幽灵 min-content，同上轮 topaz 根因）→ 模拟器全部网格项 min-w-0 修复 → 390 稳定
+- lint 0 错误、agent-browser 全链路验证（提交→统计 chip 1次↔0次、事件流 RESERVED/BACKFILL、估算卡全要素+应用按钮、移动端 390）
+- commit + push 到 Jing0715-fer/cryoflow-test-platform
+
+Stage Summary:
+- 模拟器从"资源池装箱"升级为"真实 Slurm 调度策略对比器"（FIFO vs EASY backfill + 预约安全），工作流从 10→17 job 更贴近 EMPIAR-10017 真实并行拓扑
+- SBATCH --time 从模板默认值升级为真实测量锚定（沙箱实测 × 速度比 × 安全系数），打通"实测数据 → HPC 规划"数据链
+- 平台 9 个功能区块，0 错误运行
+
+未解决/风险：
+- 大集群（≥6 GPU）下工作流无资源争用→backfill 0 次（诚实语义：资源充裕时回填无事可做）；如需更丰富的争用演示可再加并行分支
+- 速度比模型是经验值（25×/4×），真实集群首跑后应用 sacct 实测回调（估算卡注记已提示）
+- 下一轮候选：①findings 卡片加 git 链接/复制 ②导出报告纳入新区块（引擎状态/耗时/估算卡）③模拟器 A/B 并排对比视图 ④测试矩阵行跳转 Gantt
