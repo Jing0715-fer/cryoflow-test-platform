@@ -1,11 +1,13 @@
 "use client";
 
-import { LayoutGrid, Brain, Network, Gauge, FileCode2, Bug } from "lucide-react";
+import { LayoutGrid, Brain, Network, Gauge, FileCode2, Bug, Hourglass } from "lucide-react";
 import { Navbar } from "@/components/report/navbar";
 import { Hero } from "@/components/report/hero";
+import { EngineStatusStrip } from "@/components/report/engine-status";
 import { TestMatrix } from "@/components/report/test-matrix";
 import { TopazSection } from "@/components/report/topaz-section";
 import { FindingsSection } from "@/components/report/findings-section";
+import { WalltimeSection } from "@/components/report/walltime-section";
 import { HpcArchitecture } from "@/components/report/hpc-architecture";
 import { SlurmSimulator } from "@/components/report/simulator";
 import { SbatchGenerator } from "@/components/report/sbatch-generator";
@@ -25,6 +27,9 @@ export default function Page() {
         <div id="overview" className="scroll-mt-24">
           <div className="mx-auto max-w-7xl px-4 sm:px-6">
             <Hero report={report} isFetching={query.isFetching} />
+            <div className="mt-4">
+              <EngineStatusStrip />
+            </div>
           </div>
         </div>
 
@@ -49,6 +54,17 @@ export default function Page() {
             description="全面测试不止于跑通——每一条都是真实复现、定位到根因、并已修复或明确归因的发现。修复已提交到 cryoflow 仓库（可 git log 查看）。"
           >
             <FindingsSection />
+          </SectionShell>
+
+          {/* Section 2.6 — wall-time analytics */}
+          <SectionShell
+            id="walltime"
+            icon={Hourglass}
+            eyebrow="Section 2.6"
+            title="真实执行耗时分析"
+            description="每个 job 的实际 wall-time（对数刻度条形图）：真实二进制执行与深度学习训练占据总耗时绝大部分，直观呈现 CPU 沙箱的时间成本分布，也是 GPU 分区价值的最直接论据。"
+          >
+            <WalltimeSection jobs={report.jobs} />
           </SectionShell>
 
           {/* Section 3 — Topaz deep dive */}

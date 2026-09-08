@@ -12,6 +12,7 @@ const NAV_ITEMS = [
   { href: "#overview", label: "总览" },
   { href: "#matrix", label: "测试矩阵" },
   { href: "#findings", label: "问题发现" },
+  { href: "#walltime", label: "耗时分析" },
   { href: "#topaz", label: "Topaz 专项" },
   { href: "#architecture", label: "HPC 架构" },
   { href: "#simulator", label: "调度模拟器" },

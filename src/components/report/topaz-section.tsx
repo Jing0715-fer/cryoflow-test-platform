@@ -52,15 +52,15 @@ function TopazResultCard({ job }: { job?: MergedJob }) {
   const missing = extractModuleError(job);
   const status = job?.status ?? "pending";
   return (
-    <Card className="h-full border-border/70">
-      <CardHeader className="p-4 pb-2">
+    <Card className="h-full min-w-0 border-border/70">
+      <CardHeader className="min-w-0 p-4 pb-2">
         <div className="flex flex-wrap items-center gap-2">
           <CardTitle className="text-sm">{job?.name ?? "Topaz Train + Picking"}</CardTitle>
           <StatusBadge status={status} compact />
         </div>
         <CardDescription className="font-mono text-[10px]">{job?.key ?? "topaztrain"}</CardDescription>
       </CardHeader>
-      <CardContent className="space-y-2 p-4 pt-2 text-xs leading-relaxed">
+      <CardContent className="min-w-0 space-y-2 p-4 pt-2 text-xs leading-relaxed">
         {status === "pass" && (
           <p className="flex items-start gap-1.5 text-emerald-700 dark:text-emerald-400">
             <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden />
@@ -115,9 +115,9 @@ export function TopazSection({ jobs }: { jobs: MergedJob[] }) {
 
   return (
     <div className="space-y-4">
-      <div className="grid gap-4 lg:grid-cols-2">
+      <div className="grid min-w-0 grid-cols-1 gap-4 lg:grid-cols-2">
         {/* dependency chain */}
-        <Card className="border-border/70">
+        <Card className="min-w-0 border-border/70">
           <CardHeader className="p-4 pb-3 sm:p-6 sm:pb-3">
             <CardTitle className="text-base">外部依赖链（沙箱实测）</CardTitle>
             <CardDescription className="text-xs">
@@ -163,7 +163,7 @@ export function TopazSection({ jobs }: { jobs: MergedJob[] }) {
         </Card>
 
         {/* data flow */}
-        <Card className="border-border/70">
+        <Card className="min-w-0 border-border/70">
           <CardHeader className="p-4 pb-3 sm:p-6 sm:pb-3">
             <CardTitle className="text-base">训练 → 模型 → 拾取 数据流</CardTitle>
             <CardDescription className="text-xs">
@@ -223,7 +223,7 @@ export function TopazSection({ jobs }: { jobs: MergedJob[] }) {
       </div>
 
       {/* live results */}
-      <div className="grid gap-4 md:grid-cols-2">
+      <div className="grid min-w-0 grid-cols-1 gap-4 md:grid-cols-2">
         <TopazResultCard job={topaztrain} />
         <TopazResultCard job={autopick} />
       </div>
