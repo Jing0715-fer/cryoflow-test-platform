@@ -102,3 +102,23 @@ Stage Summary:
 - 外部应用实测矩阵：topaz 真实训练+拾取 ✓ · DynaMight CPU VAE ✓ · ModelAngelo 诚实不可用（无 GPU）· ctffind 4.1.14 ✓ · RELION 5.0.1 全家桶 ✓
 - HPC 交付（Task 3 已完成）：slurm.ts 模块 + 3 API + job-inspector HPC 对话框 + docs/hpc-slurm-design.md + 报告平台 S4/S5/S6（架构图/模拟器/SBATCH 生成器）
 - 报告平台 :3000 运行中（用户唯一可见窗口）；cryoflow 原项目 :3001 运行中（真实引擎）
+
+---
+Task ID: 6 (主代理 · 推送 GitHub)
+Agent: main (Z.ai Code)
+Task: 用户要求把全部工作成果 push 到 GitHub（提供 PAT）
+
+Work Log:
+- 验证 token：属主 = Jing0715-fer（即 cryoflow 仓库所有者，可直接推）
+- 推送前安全扫描：两仓库历史中无 ghp_/密钥泄漏（干净）
+- cryoflow：origin 在 clone 后前进 10 提交（Task 17-20：sparklines/workflow import/topaz 训练图表）→ git rebase origin/main 零冲突，本地 5 提交（F1/F2 topaz 修复、HPC 模块、F5 顺序回退、F6 星表收集、halves 合成）重放到 d1f67c2 之上；补交 scripts/dev-server-3001.sh（:3001 独立启动器）+ .gitignore 忽略 3001 日志
+- push（一次性 token URL，不写 .git/config）：d1f67c2..23f5d0d main→main ✓，API 验证远端 HEAD=23f5d0d
+- my-project 报告平台：git rm --cached .env + db/custom.db（本地路径配置/运行时 DB，不宜入库）+ .gitignore 补 db/*.db；新建公开仓库 Jing0715-fer/cryoflow-test-platform（API 创建）；推送 4 提交 ✓；补写根 README（测试范围/F1-F6/平台 6 区块/数据契约/运行方式）再推（733f092）；origin 配置为干净 URL + upstream 跟踪
+- 提交作者统一用 Jing0715-fer noreply 身份（新提交）；历史提交保留原身份
+
+Stage Summary:
+- 两个仓库均已上线：
+  ① https://github.com/Jing0715-fer/cryoflow @23f5d0d（原项目 + 6 个新提交：引擎修复 F1/F2/F5/F6 + HPC/Slurm 模块 + 启动脚本）
+  ② https://github.com/Jing0715-fer/cryoflow-test-platform @733f092（测试报告平台，含 README）
+- token 仅在推送命令中一次性使用，未持久化到任何 .git/config 或文件
+- 风险提示：PAT 已在对话中明文出现，建议用户用完后在 GitHub Settings→Developer settings→Tokens 撤销轮换
