@@ -1,4 +1,4 @@
-import type { SbatchJobType, SbatchRequest, SbatchResponse } from "@/lib/types";
+import type { SbatchEstimate, SbatchJobType, SbatchRequest, SbatchResponse, TestJob } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
 // SBATCH script generator — job-type aware templates for a Slurm HPC cluster
@@ -228,3 +228,74 @@ export const SBATCH_JOB_TYPES: { value: SbatchJobType; label: string; desc: stri
   { value: "class3d-screening", label: "class3d · K 扫描筛选", desc: "array 并行试不同类数 K，择优进入精化" },
   { value: "ctffind-array", label: "ctffind · CPU array", desc: "纯 CPU 分区 array 作业，OpenMP 多线程" },
 ];
+
+// ---------------------------------------------------------------------------
+// Time-limit estimation anchored on REAL measured wall-times from the
+// EMPIAR-10017 test run (db/test-results.json). The sandbox measured every
+// job on CPU (3GB, sequential fallback --j 4); the estimator projects those
+// measurements onto the HPC target with a per-type speedup model and a 1.5×
+// safety factor, so the generated #SBATCH --time is grounded in reality
+// instead of a guess.
+// ---------------------------------------------------------------------------
+
+/** test-results.json job key backing each SBATCH template (exported for the route) */
+export const MEASURED_KEY: Record<SbatchJobType, string> = {
+  "motioncorr-array": "motioncorr",
+  topaztrain: "topaztrain",
+  class2d: "class2d",
+  refine3d: "refine3d",
+  "class3d-screening": "class3d",
+  "ctffind-array": "ctffind",
+};
+
+/** honest speedup model: sandbox CPU baseline → A100-class HPC target */
+const SPEEDUP: Record<SbatchJobType, { factor: number; basis: string }> = {
+  topaztrain: { factor: 25, basis: "resnet16 训练：A100 vs CPU torch（经验区间 20–30×）" },
+  class2d: { factor: 4, basis: "MPI 32 核 vs 沙箱 --j 4 顺序回退（投影匹配近线性区）" },
+  refine3d: { factor: 4, basis: "MPI 32 核 + GPU 投影 vs 沙箱顺序模式" },
+  "class3d-screening": { factor: 4, basis: "MPI 32 核 + GPU 投影 vs 沙箱顺序模式" },
+  "ctffind-array": { factor: 1.2, basis: "CPU 密集逐微图计算，单任务耗时基本不变；吞吐提升来自 array 并行" },
+  "motioncorr-array": { factor: 8, basis: "MotionCor2 GPU vs CPU（本沙箱无真实测量，速度比按官方基准）" },
+};
+
+const MEASURABLE_LEVELS = new Set(["real", "external-app-real"]);
+
+function roundTo(v: number, step: number): number {
+  return Math.max(step, Math.round(v / step) * step);
+}
+
+export function estimateTimeLimit(jobType: SbatchJobType, job: TestJob | undefined): SbatchEstimate {
+  const model = SPEEDUP[jobType];
+  const real = job && MEASURABLE_LEVELS.has(job.level) ? (job.durationSec ?? null) : null;
+
+  if (real == null) {
+    return {
+      jobKey: MEASURED_KEY[jobType],
+      measuredSec: null,
+      measuredLevel: job?.level ?? "pending",
+      speedup: model.factor,
+      speedupBasis: model.basis,
+      estimatedMin: null,
+      suggestedLimitMin: null,
+      note:
+        job?.level === "input-unavailable"
+          ? "EMPIAR-10017 未发布电影帧（motioncorr 无真实测量）——时限建议保留模板默认值并按首次 sacct 实测回调"
+          : "该 job 类型暂无真实测量锚点，时限采用模板默认值",
+    };
+  }
+
+  const estimatedSec = real / model.factor;
+  const estimatedMin = roundTo(estimatedSec / 60, 1);
+  // 1.5× safety factor (cold start, I/O, checkpoint) + 10min floor, 5min steps
+  const suggestedLimitMin = Math.max(10, roundTo(estimatedMin * 1.5, 5));
+  return {
+    jobKey: MEASURED_KEY[jobType],
+    measuredSec: real,
+    measuredLevel: job?.level ?? "",
+    speedup: model.factor,
+    speedupBasis: model.basis,
+    estimatedMin,
+    suggestedLimitMin,
+    note: `基于沙箱真实测量 ${real.toFixed(0)}s（level=${job?.level}）÷ ${model.factor}× 速度比 ×1.5 安全系数——建议先按此值提交，首个作业完成后用 sacct -j 实测回调`,
+  };
+}

@@ -97,7 +97,51 @@ function tryAllocate(
   return { nodeIds, gpuIds };
 }
 
-export function simulate(cluster: SimClusterConfig, jobs: SimJob[]): SimulateResponse {
+/**
+ * Conservative resource reservation for the blocked head-of-queue job:
+ * walk running GPU tasks in completion order, free their GPUs batch-by-batch
+ * (same-timestamp completions grouped), and return the earliest time the head
+ * job's allocation succeeds. No future starts are assumed — this is exactly
+ * the EASY backfill safety baseline.
+ */
+function computeReservation(
+  head: InnerTask,
+  freeGpus: number[],
+  running: { task: InnerTask; endMin: number }[],
+  cluster: SimClusterConfig,
+  clock: number
+): number {
+  const sim = [...freeGpus];
+  const gpuRunning = running
+    .filter((r) => r.task.gpus > 0)
+    .sort((a, b) => a.endMin - b.endMin);
+  let t = clock;
+  for (let i = 0; i < gpuRunning.length; i++) {
+    t = gpuRunning[i].endMin;
+    // free every task completing at this same timestamp (batch = one Slurm cycle)
+    for (let k = i; k < gpuRunning.length && gpuRunning[k].endMin <= t + 1e-9; k++) {
+      const task = gpuRunning[k].task;
+      const perNode = new Map<number, number>();
+      for (const id of task.gpuIds) {
+        const n = Number(id.slice(1, id.indexOf(":")));
+        perNode.set(n, (perNode.get(n) ?? 0) + 1);
+      }
+      for (const [n, c] of perNode) sim[n] += c;
+      i = k; // advance outer index to the last batch member
+    }
+    if (tryAllocate(head.gpus, cluster.gpusPerNode, sim, true)) return t;
+  }
+  // after everything completes the cluster is fully free (feasibility guard
+  // already ensured head.gpus ≤ capacity)
+  return gpuRunning.length > 0 ? gpuRunning[gpuRunning.length - 1].endMin : clock;
+}
+
+export function simulate(
+  cluster: SimClusterConfig,
+  jobs: SimJob[],
+  options?: { backfill?: boolean }
+): SimulateResponse {
+  const backfill = options?.backfill ?? false;
   const capacity = cluster.nodes * cluster.gpusPerNode;
   const speed = GPU_SPEED_FACTOR[cluster.gpuModel] ?? 1;
   const events: SimEvent[] = [];
@@ -186,6 +230,7 @@ export function simulate(cluster: SimClusterConfig, jobs: SimJob[]): SimulateRes
   let clock = 0;
   let allDone = false;
   let guard = 0;
+  let backfillCountTotal = 0; // tasks started via backfill across all cycles
 
   while (!allDone && guard++ < 100000) {
     // 1. dependency clearing (job key completes when all its tasks complete)
@@ -210,20 +255,20 @@ export function simulate(cluster: SimClusterConfig, jobs: SimJob[]): SimulateRes
       }
     }
 
-    // 2. FIFO first-fit allocation over eligible tasks
+    // 2. FIFO allocation over eligible tasks (+ optional EASY backfill with reservation)
+    //
+    // strict FIFO: the first GPU task that cannot be allocated blocks the whole
+    // GPU queue behind it (classic Slurm without sched/backfill).
+    // backfill: later tasks may jump the queue only if they fit in the currently
+    // free GPUs AND finish before the head job's reserved start time — the EASY
+    // algorithm's safety rule, which guarantees the head job is never delayed.
     const eligible = tasks
       .filter((t) => t.eligible && !t.started)
       .sort((a, b) => a.seq - b.seq);
-    for (const t of eligible) {
-      if (t.gpus === 0 && runningCpu >= cpuSlots) {
-        t.waitReason = `CPU 分区并发已满（${runningCpu}/${cpuSlots}）—— squeue PENDING (Resources)`;
-        continue;
-      }
-      const alloc = tryAllocate(t.gpus, cluster.gpusPerNode, freeGpus, true);
-      if (!alloc) {
-        t.waitReason = `GPU 资源不足（需 ${t.gpus}×${cluster.gpuModel}，当前空闲 ${freeGpus.reduce((a, b) => a + b, 0)}）`;
-        continue; // first-fit: let smaller/later tasks still pack in
-      }
+    let headBlocked: InnerTask | null = null;
+    let reservation = Infinity; // reserved start time for the head-of-queue job
+
+    const startTask = (t: InnerTask, alloc: Alloc, viaBackfill: boolean) => {
       t.started = true;
       t.startMin = clock;
       t.endMin = clock + t.durationMin;
@@ -232,18 +277,75 @@ export function simulate(cluster: SimClusterConfig, jobs: SimJob[]): SimulateRes
       t.waitReason = "";
       if (t.gpus === 0) runningCpu++;
       running.push({ task: t, endMin: t.endMin });
-      events.push({
-        t: clock,
-        jobId: t.jobId,
-        type: "ALLOCATED",
-        detail: `分配 ${t.gpus === 0 ? "CPU 槽位" : `${alloc.gpuIds.join(" ")} @ ${alloc.nodeIds.map((n) => `节点${n}`).join("+")}`} → squeue 状态 RUNNING`,
-      });
+      if (viaBackfill) {
+        backfillCountTotal++;
+        events.push({
+          t: clock,
+          jobId: t.jobId,
+          type: "BACKFILL",
+          detail: `碎片回填：${t.label} 插队启动（${t.durationMin.toFixed(1)} min ≤ 预约窗口，不推迟队首）`,
+        });
+      } else {
+        events.push({
+          t: clock,
+          jobId: t.jobId,
+          type: "ALLOCATED",
+          detail: `分配 ${t.gpus === 0 ? "CPU 槽位" : `${alloc.gpuIds.join(" ")} @ ${alloc.nodeIds.map((n) => `节点${n}`).join("+")}`} → squeue 状态 RUNNING`,
+        });
+      }
       events.push({
         t: clock,
         jobId: t.jobId,
         type: "RUNNING",
         detail: `${t.label} 开始（预计 ${t.durationMin.toFixed(1)} min）`,
       });
+    };
+
+    for (const t of eligible) {
+      // CPU track: independent partition, never blocked by (nor blocking) the GPU queue
+      if (t.gpus === 0) {
+        if (runningCpu >= cpuSlots) {
+          t.waitReason = `CPU 分区并发已满（${runningCpu}/${cpuSlots}）—— squeue PENDING (Resources)`;
+          continue;
+        }
+        startTask(t, { nodeIds: [], gpuIds: [] }, false);
+        continue;
+      }
+
+      if (!headBlocked) {
+        const alloc = tryAllocate(t.gpus, cluster.gpusPerNode, freeGpus, true);
+        if (alloc) {
+          startTask(t, alloc, false);
+        } else {
+          headBlocked = t;
+          reservation = computeReservation(t, freeGpus, running, cluster, clock);
+          t.waitReason = `GPU 资源不足——已预约 T+${(reservation - clock).toFixed(0)}′ 启动（squeue PENDING (Resources)）`;
+          events.push({
+            t: clock,
+            jobId: t.jobId,
+            type: "RESERVED",
+            detail: `队首作业预约：${t.label} 将于 T+${(reservation - clock).toFixed(0)}′ 获得资源（backfill 安全基线）`,
+          });
+        }
+        continue;
+      }
+
+      // --- behind a blocked head ---
+      if (!backfill) {
+        t.waitReason = `FIFO 严格排队：等待队首 ${headBlocked.label} 的资源预约`;
+        continue;
+      }
+      // EASY safety: candidate must finish before the head's reserved start
+      if (clock + t.durationMin > reservation) {
+        t.waitReason = `backfill 窗口不足：需 ${t.durationMin.toFixed(1)} min，剩余 ${Math.max(0, reservation - clock).toFixed(0)}′（推迟队首 = 不允许）`;
+        continue;
+      }
+      const alloc = tryAllocate(t.gpus, cluster.gpusPerNode, freeGpus, true);
+      if (!alloc) {
+        t.waitReason = "资源不足（backfill 候选未能装箱当前空闲 GPU）";
+        continue;
+      }
+      startTask(t, alloc, true);
     }
 
     // 3. advance time to the next completion event
@@ -325,14 +427,16 @@ export function simulate(cluster: SimClusterConfig, jobs: SimJob[]): SimulateRes
       totalJobs: tasks.length,
       gpuMinutes: Math.round(gpuMinutes * 10) / 10,
       clusterGpuCapacity: capacity,
+      backfilledJobs: backfillCountTotal,
+      strategy: backfill ? "easy-backfill" : "strict-fifo",
     },
     tasks: outTasks,
     events,
     utilizationSeries,
     notes: [
-      `调度策略：优先级 FIFO（提交顺序）+ 依赖 DAG（--dependency=afterok）+ GPU 池首适配分配。`,
+      `调度策略：${backfill ? "优先级 FIFO + EASY backfill（预约安全：回填作业必须先于队首预约启动点完成）" : "严格 FIFO（未启用 backfill，队首资源阻塞整条 GPU 队列）"}。`,
       `${cluster.gpuModel} 加速比按 ${speed === 1 ? "1.0×" : speed + "×"} 估算作业时长（A100=1.0×，H100=0.6×）。`,
-      `CPU 作业（ctffind array 等 --gres=gpu:0）不占用 GPU 池，就绪即并行启动。`,
+      `CPU 作业（ctffind array 等 --gres=gpu:0）不占用 GPU 池，独立分轨就绪即启动。`,
       `GPU 占用率 = Σ(作业 GPU 数 × 运行时长) / (集群 GPU 总数 × makespan)。`,
       `模拟为无副作用纯计算，真实集群中由 squeue/sacct 轮询回填同样的事件流。`,
     ],

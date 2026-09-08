@@ -87,6 +87,8 @@ export interface SimJob {
 export interface SimulateRequest {
   cluster: SimClusterConfig;
   jobs: SimJob[];
+  /** EASY backfill with reservation safety (default false = strict FIFO). */
+  backfill?: boolean;
 }
 
 export interface SimTask {
@@ -109,7 +111,7 @@ export interface SimTask {
 export interface SimEvent {
   t: number;
   jobId: string;
-  type: "SUBMITTED" | "DEPS-CLEARED" | "ALLOCATED" | "RUNNING" | "COMPLETED";
+  type: "SUBMITTED" | "DEPS-CLEARED" | "ALLOCATED" | "RESERVED" | "BACKFILL" | "RUNNING" | "COMPLETED";
   detail: string;
 }
 
@@ -121,6 +123,8 @@ export interface SimulateResponse {
     totalJobs: number;
     gpuMinutes: number;
     clusterGpuCapacity: number;
+    backfilledJobs: number; // tasks that started via backfill (0 when strict FIFO)
+    strategy: "strict-fifo" | "easy-backfill";
   };
   tasks: SimTask[];
   events: SimEvent[];
@@ -153,4 +157,19 @@ export interface SbatchRequest {
 export interface SbatchResponse {
   script: string;
   annotations: { line: number; note: string }[];
+  /** Time-limit estimate anchored on the real measured wall-time from the
+   *  EMPIAR-10017 run (present when a measurement backs the job type). */
+  estimate?: SbatchEstimate;
+}
+
+export interface SbatchEstimate {
+  jobKey: string;
+  /** real measured wall-time in the CPU sandbox (null = no real measurement) */
+  measuredSec: number | null;
+  measuredLevel: string;
+  speedup: number;
+  speedupBasis: string;
+  estimatedMin: number | null;
+  suggestedLimitMin: number | null;
+  note: string;
 }

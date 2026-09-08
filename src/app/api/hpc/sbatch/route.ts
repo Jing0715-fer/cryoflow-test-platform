@@ -1,8 +1,23 @@
 import { NextResponse } from "next/server";
+import { readFile } from "fs/promises";
+import path from "path";
 import { z } from "zod";
-import { generateSbatch } from "@/lib/hpc/sbatch";
+import { generateSbatch, estimateTimeLimit, MEASURED_KEY } from "@/lib/hpc/sbatch";
+import type { TestJob, TestResults } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
+
+async function loadMeasuredJobs(): Promise<Map<string, TestJob>> {
+  const file = path.join(process.cwd(), "db", "test-results.json");
+  try {
+    const text = await readFile(file, "utf-8");
+    const json = JSON.parse(text) as TestResults;
+    return new Map((json.jobs ?? []).map((j) => [j.key, j]));
+  } catch {
+    // measurement file missing → estimates degrade to template defaults
+    return new Map();
+  }
+}
 
 const BodySchema = z.object({
   jobType: z.enum([
@@ -32,7 +47,9 @@ export async function POST(request: Request) {
       );
     }
     const result = generateSbatch(parsed.data);
-    return NextResponse.json(result);
+    const measured = await loadMeasuredJobs();
+    const estimate = estimateTimeLimit(parsed.data.jobType, measured.get(MEASURED_KEY[parsed.data.jobType]));
+    return NextResponse.json({ ...result, estimate });
   } catch {
     return NextResponse.json({ error: "SBATCH 生成失败" }, { status: 400 });
   }

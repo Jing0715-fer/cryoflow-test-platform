@@ -1,7 +1,8 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { FileCode2, Copy, Wand2, ListChecks } from "lucide-react";
+import { motion } from "framer-motion";
+import { FileCode2, Copy, Wand2, ListChecks, Timer, FlaskConical, ArrowRight, CircleCheck } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
@@ -10,7 +11,7 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { useToast } from "@/hooks/use-toast";
 import { SBATCH_JOB_TYPES } from "@/lib/hpc/sbatch";
-import type { SbatchJobType, SbatchResponse } from "@/lib/types";
+import type { SbatchEstimate, SbatchJobType, SbatchResponse } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 const ARRAY_TYPES = new Set<SbatchJobType>(["motioncorr-array", "class3d-screening", "ctffind-array"]);
@@ -243,7 +244,96 @@ export function SbatchGenerator() {
           </CardContent>
         </Card>
       </div>
+
+      {/* estimate callout: real measured anchor → HPC time-limit projection (full width) */}
+      {result?.estimate && (
+        <EstimateCallout
+          est={result.estimate}
+          onApply={(v) => {
+            setOpts((o) => ({ ...o, timeLimitMin: v }));
+            toast({ title: "已应用建议时限", description: `--time 更新为 ${v} 分钟，重新生成脚本即可生效` });
+          }}
+        />
+      )}
     </div>
+  );
+}
+
+function fmtSec(sec: number): string {
+  if (sec < 60) return `${sec.toFixed(1)}s`;
+  const m = Math.floor(sec / 60);
+  const s = Math.round(sec % 60);
+  if (m < 60) return `${m}m ${s}s`;
+  return `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+
+function EstimateCallout({ est, onApply }: { est: SbatchEstimate; onApply: (min: number) => void }) {
+  const hasMeasurement = est.measuredSec != null && est.estimatedMin != null;
+  return (
+    <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.35 }}>
+      <Card className="border-primary/25 bg-primary/[0.04]">
+        <CardHeader className="p-4 pb-2">
+          <CardTitle className="flex items-center gap-2 text-sm">
+            <Timer className="h-4 w-4 text-primary" aria-hidden /> 真实测量锚点 → HPC 时限预估
+          </CardTitle>
+          <CardDescription className="text-xs">
+            基于 EMPIAR-10017 沙箱实测 wall-time 的 #SBATCH --time 建议（不再是拍脑袋默认值）
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="p-4 pt-1">
+          {hasMeasurement ? (
+            <>
+              <div className="flex flex-wrap items-stretch gap-2">
+                {/* measured anchor */}
+                <div className="min-w-40 flex-1 rounded-lg border border-teal-300/50 bg-teal-50/50 p-3 dark:border-teal-800/50 dark:bg-teal-950/25">
+                  <p className="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-teal-700 dark:text-teal-300">
+                    <FlaskConical className="h-3 w-3" aria-hidden /> 沙箱实测（CPU）
+                  </p>
+                  <p className="mt-1 font-mono text-lg font-bold tabular-nums text-teal-700 dark:text-teal-300">
+                    {fmtSec(est.measuredSec as number)}
+                  </p>
+                  <p className="font-mono text-[10px] text-muted-foreground">{est.jobKey} · level={est.measuredLevel}</p>
+                </div>
+                <div className="flex items-center px-1 text-muted-foreground" aria-hidden>
+                  <ArrowRight className="h-4 w-4" />
+                </div>
+                {/* speedup */}
+                <div className="min-w-40 flex-1 rounded-lg border border-violet-300/50 bg-violet-50/50 p-3 dark:border-violet-800/50 dark:bg-violet-950/25">
+                  <p className="text-[10px] font-semibold uppercase tracking-wide text-violet-700 dark:text-violet-300">速度比模型</p>
+                  <p className="mt-1 font-mono text-lg font-bold tabular-nums text-violet-700 dark:text-violet-300">÷ {est.speedup}×</p>
+                  <p className="text-[10px] leading-snug text-muted-foreground">{est.speedupBasis}</p>
+                </div>
+                <div className="flex items-center px-1 text-muted-foreground" aria-hidden>
+                  <ArrowRight className="h-4 w-4" />
+                </div>
+                {/* suggested limit */}
+                <div className="min-w-40 flex-1 rounded-lg border border-primary/40 bg-primary/10 p-3">
+                  <p className="text-[10px] font-semibold uppercase tracking-wide text-primary">建议 --time</p>
+                  <p className="mt-1 font-mono text-lg font-bold tabular-nums text-primary">{est.suggestedLimitMin} min</p>
+                  <p className="text-[10px] leading-snug text-muted-foreground">≈ {est.estimatedMin}min ×1.5 安全系数</p>
+                </div>
+                {/* apply */}
+                <div className="flex items-center">
+                  <Button
+                    size="sm"
+                    className="h-11 gap-1.5"
+                    onClick={() => est.suggestedLimitMin && onApply(est.suggestedLimitMin)}
+                  >
+                    <CircleCheck className="h-3.5 w-3.5" aria-hidden /> 应用建议时限
+                  </Button>
+                </div>
+              </div>
+              <p className="mt-3 text-[11px] leading-relaxed text-muted-foreground">{est.note}</p>
+            </>
+          ) : (
+            <div className="flex items-start gap-2 rounded-lg border border-amber-300/50 bg-amber-50/50 p-3 text-xs leading-relaxed text-amber-800 dark:border-amber-800/50 dark:bg-amber-950/25 dark:text-amber-300">
+              <FlaskConical className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
+              <p>{est.note}</p>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+    </motion.div>
   );
 }
 

@@ -26,6 +26,7 @@ const JobSchema = z.object({
 const BodySchema = z.object({
   cluster: ClusterSchema,
   jobs: z.array(JobSchema).min(1).max(64),
+  backfill: z.boolean().optional().default(false),
 });
 
 export async function POST(request: Request) {
@@ -38,7 +39,7 @@ export async function POST(request: Request) {
         { status: 400 }
       );
     }
-    const result = simulate(parsed.data.cluster, parsed.data.jobs);
+    const result = simulate(parsed.data.cluster, parsed.data.jobs, { backfill: parsed.data.backfill });
     return NextResponse.json(result);
   } catch (err) {
     const message = err instanceof Error ? err.message : "模拟器内部错误";

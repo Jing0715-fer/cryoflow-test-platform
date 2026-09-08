@@ -14,6 +14,7 @@ import {
   Timer,
   Cpu,
   Gpu,
+  Layers2,
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -45,12 +46,13 @@ export function SlurmSimulator() {
   const { toast } = useToast();
   const [cluster, setCluster] = useState<ClusterForm>({
     partitions: 1,
-    nodes: 2,
+    nodes: 1,
     gpusPerNode: 4,
     gpuModel: "A100",
     defaultTimeMin: 60,
   });
   const [enabled, setEnabled] = useState<Set<string>>(() => new Set(WORKFLOW_JOBS.map((j) => j.key)));
+  const [backfill, setBackfill] = useState(true);
   const [result, setResult] = useState<SimulateResponse | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [clock, setClock] = useState(0);
@@ -131,6 +133,7 @@ export function SlurmSimulator() {
         body: JSON.stringify({
           cluster: { ...cluster, defaultTimeMin: Math.max(cluster.defaultTimeMin, 10) },
           jobs,
+          backfill,
         }),
       });
       const data = await res.json();
@@ -144,7 +147,7 @@ export function SlurmSimulator() {
       setPlaying(true);
       toast({
         title: "工作流已提交（模拟）",
-        description: `${data.stats.totalJobs} 个 Slurm 作业进入调度器 · makespan ${data.stats.makespanMin} min`,
+        description: `${data.stats.totalJobs} 个 Slurm 作业进入调度器 · makespan ${data.stats.makespanMin} min · ${data.stats.backfilledJobs} 次 backfill 回填`,
       });
     } catch {
       toast({ title: "网络错误", description: "无法连接 /api/hpc/simulate", variant: "destructive" });
@@ -196,10 +199,10 @@ export function SlurmSimulator() {
   }, [gpuSeries, makespan, result]);
 
   return (
-    <div className="grid gap-4 xl:grid-cols-[380px_minmax(0,1fr)]">
+    <div className="grid min-w-0 grid-cols-1 gap-4 xl:grid-cols-[380px_minmax(0,1fr)]">
       {/* ================= left: config panel ================= */}
-      <div className="space-y-4">
-        <Card className="border-border/70">
+      <div className="min-w-0 space-y-4">
+        <Card className="min-w-0 border-border/70">
           <CardHeader className="p-4 pb-3">
             <CardTitle className="flex items-center gap-2 text-sm">
               <Server className="h-4 w-4 text-primary" aria-hidden /> 集群配置
@@ -255,6 +258,25 @@ export function SlurmSimulator() {
                 aria-label="计算节点数"
               />
             </div>
+            {/* backfill strategy switch */}
+            <div className="flex items-start justify-between gap-3 rounded-lg border border-primary/20 bg-primary/5 p-3">
+              <div className="min-w-0">
+                <p className="flex items-center gap-1.5 text-xs font-semibold text-foreground">
+                  <Layers2 className="h-3.5 w-3.5 text-primary" aria-hidden />
+                  Backfill 碎片回填
+                </p>
+                <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
+                  EASY 算法 + 资源预约安全：队首阻塞时，更短的后排作业可插队填补空闲 GPU——但必须先于队首预约启动点完成（绝不推迟队首）。
+                  试试 1 节点×4 GPU 下切换对比。
+                </p>
+              </div>
+              <Switch
+                checked={backfill}
+                onCheckedChange={setBackfill}
+                aria-label="启用 backfill 碎片回填调度"
+                className="mt-0.5 shrink-0"
+              />
+            </div>
             <div>
               <div className="flex items-center justify-between">
                 <Label2>每节点 GPU 数</Label2>
@@ -306,7 +328,7 @@ export function SlurmSimulator() {
         </Card>
 
         {/* queue */}
-        <Card className="border-border/70">
+        <Card className="min-w-0 border-border/70">
           <CardHeader className="p-4 pb-2">
             <CardTitle className="flex items-center gap-2 text-sm">
               <ListOrdered className="h-4 w-4 text-primary" aria-hidden /> 作业队列（依赖 DAG）
@@ -371,7 +393,7 @@ export function SlurmSimulator() {
       </div>
 
       {/* ================= right: results ================= */}
-      <div className="space-y-4">
+      <div className="min-w-0 space-y-4">
         {!result ? (
           <Card className="flex min-h-[420px] flex-col items-center justify-center gap-3 border-dashed border-border/70 p-8 text-center">
             <Gauge className="h-10 w-10 text-muted-foreground/40" aria-hidden />
@@ -399,6 +421,7 @@ export function SlurmSimulator() {
                 tone="text-cyan-600 dark:text-cyan-400"
               />
               <StatCell icon={ListOrdered} label="Slurm 作业数" value={String(result.stats.totalJobs)} tone="text-violet-600 dark:text-violet-400" />
+              <StatCell icon={Layers2} label="backfill 回填" value={`${result.stats.backfilledJobs} 次`} tone="text-cyan-600 dark:text-cyan-400" />
               <StatCell icon={Gpu} label="GPU·分钟" value={result.stats.gpuMinutes.toFixed(0)} tone="text-amber-600 dark:text-amber-400" />
               <StatCell
                 icon={Play}
@@ -666,11 +689,15 @@ export function SlurmSimulator() {
                             "shrink-0 rounded px-1 text-[9px] font-bold",
                             e.type === "COMPLETED"
                               ? "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400"
-                              : e.type === "RUNNING" || e.type === "ALLOCATED"
-                                ? "bg-teal-500/15 text-teal-600 dark:text-teal-400"
-                                : e.type === "DEPS-CLEARED"
-                                  ? "bg-violet-500/15 text-violet-600 dark:text-violet-400"
-                                  : "bg-muted text-muted-foreground"
+                              : e.type === "BACKFILL"
+                                ? "bg-cyan-500/15 text-cyan-600 dark:text-cyan-400"
+                                : e.type === "RESERVED"
+                                  ? "bg-amber-500/15 text-amber-600 dark:text-amber-500"
+                                  : e.type === "RUNNING" || e.type === "ALLOCATED"
+                                    ? "bg-teal-500/15 text-teal-600 dark:text-teal-400"
+                                    : e.type === "DEPS-CLEARED"
+                                      ? "bg-violet-500/15 text-violet-600 dark:text-violet-400"
+                                      : "bg-muted text-muted-foreground"
                           )}
                         >
                           {e.type}
@@ -706,6 +733,9 @@ export function SlurmSimulator() {
                   </li>
                   <li>
                     <code className="font-mono text-foreground">squeue</code> PENDING(Reason=Dependencies/Resources) / RUNNING → 等待原因字段
+                  </li>
+                  <li>
+                    <code className="font-mono text-foreground">sched/backfill</code> → EASY 回填：队首 RESERVED 预约后，短作业 BACKFILL 插队且先于预约点完成
                   </li>
                 </ul>
                 <ul className="space-y-1.5 text-[11px] leading-relaxed text-muted-foreground">
